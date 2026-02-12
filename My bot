@@ -1,0 +1,1373 @@
+# bot.py
+import re
+import random
+import logging
+import sqlite3
+import time
+import json
+from datetime import datetime, time as time_obj
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler,
+    CallbackQueryHandler,
+)
+
+# ---------------- CONFIG ----------------
+JSON_FILE = "facebook-id-sell-472908-d5b92198cefe.json"
+SHEET_NAME = "এজেন্ট কোড নিয়ে কাজ শুরু করে দিন⌛🕡 (Responses)"
+BOT_TOKEN = "8158483330:AAGPRVkLfFdfeHE26F-QTab3I8jK5ym7qGU"
+CHANNEL_USERNAME = "@social_workars4"
+YOUTUBE_LINK = "https://youtube.com/@r2ktrackszone?si=TqwvzFG5TTQJ8udL"
+FORM_LINK = "https://forms.gle/JgNQuUdBG9iSAoDP7"
+ADMIN_IDS = [8016687898]
+WITHDRAWAL_FEE = 5
+PRIVATE_CHANNEL_ID = -1003014229156
+ADMIN_DELETE_DELAY = 10
+USER_DELETE_DELAY = 60
+
+# --- Google Sheet Column Config (1-indexed) ---
+TIMESTAMP_COL=1; GMAIL_COL=2; NAME_COL=3; WHATSAPP_COL=4; TELEGRAM_COL=5
+BKASH_COL=6; NAGAD_COL=7; BINANCE_COL=8; AGENT_CODE_COL=9; BALANCE_COL=10
+PASSWORD_COL = 11; USER_ID_COL = 12
+STATUS_COL = 13
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- DATABASE SETUP ---
+conn = sqlite3.connect("bot_state.db", check_same_thread=False)
+cur = conn.cursor()
+
+# verified_users now includes 'language'
+cur.execute("""CREATE TABLE IF NOT EXISTS verified_users (
+    user_id INTEGER PRIMARY KEY,
+    language TEXT DEFAULT 'bn'
+)""")
+
+# Add language column if not exists (Migration)
+try:
+    cur.execute("ALTER TABLE verified_users ADD COLUMN language TEXT DEFAULT 'bn'")
+except sqlite3.OperationalError:
+    pass
+
+cur.execute("""CREATE TABLE IF NOT EXISTS payment_history (
+    request_id TEXT PRIMARY KEY, 
+    user_id INTEGER, 
+    agent_code TEXT,
+    status TEXT, 
+    amount REAL, 
+    timestamp INTEGER,
+    user_message_id INTEGER
+)""")
+
+try:
+    cur.execute("ALTER TABLE payment_history ADD COLUMN agent_code TEXT")
+except sqlite3.OperationalError: pass 
+try:
+    cur.execute("ALTER TABLE payment_history ADD COLUMN user_message_id INTEGER")
+except sqlite3.OperationalError: pass
+
+cur.execute("""CREATE TABLE IF NOT EXISTS blocked_users (
+    user_id INTEGER PRIMARY KEY, 
+    reason TEXT, 
+    timestamp INTEGER
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS reset_fails (
+    agent_code TEXT PRIMARY KEY, 
+    count INTEGER
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS payment_methods (
+    method_name TEXT PRIMARY KEY,
+    is_active INTEGER DEFAULT 1
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS add_money_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_code TEXT,
+    amount REAL,
+    source TEXT,
+    date_text TEXT,
+    rate_text TEXT,
+    timestamp INTEGER
+)""")
+
+for method in ['Bkash', 'Nagad', 'Rocket', 'Binance']:
+    cur.execute("INSERT OR IGNORE INTO payment_methods (method_name, is_active) VALUES (?, 1)", (method,))
+conn.commit()
+
+# --- Conversation States ---
+ADD_MONEY_CODE, ADD_MONEY_AMOUNT, GET_ADD_SOURCE, GET_ADD_DATE, GET_ADD_RATE = range(5)
+WITHDRAW_CODE, VERIFY_PASS_FOR_WITHDRAW, CHOOSE_METHOD, ASK_AMOUNT, GET_TEMP_NUMBER = range(5, 10)
+SUBTRACT_MONEY_CODE, SUBTRACT_MONEY_AMOUNT = range(10, 12)
+UPDATE_INFO_CODE, VERIFY_PASS_FOR_UPDATE, CHOOSE_INFO_FIELD, GET_NEW_INFO = range(12, 16)
+BALANCE_CHECK_CODE, VERIFY_PASS_FOR_BALANCE = range(16, 18)
+GET_DETAILS_CODE, VERIFY_PASS_FOR_DETAILS = range(18, 20)
+GET_CODE_GMAIL, SET_NEW_PASSWORD = range(20, 22)
+ADMIN_GET_DETAILS_CODE = 22
+CHOOSE_CANCEL_OPTION, GET_CANCEL_REASON = range(23, 25)
+BROADCAST_MESSAGE, BROADCAST_CONFIRM = range(25, 27)
+SET_NOTICE_TEXT = 27
+BLOCK_USER_CODE, BLOCK_USER_REASON, UNBLOCK_USER_CODE = range(28, 31)
+RESET_CODE, RESET_VERIFY, RESET_NEW_PASS = range(31, 34)
+METHOD_CONTROL = 34
+FIX_PAYMENT_CODE = 35
+VIEW_ADD_HISTORY_CODE = 36
+BULK_SETUP_DEFAULTS, BULK_PROCESS_LIST = range(37, 39)
+
+# --- TRANSLATION DICTIONARY ---
+TRANS = {
+    'btn_get_code': {'bn': "🔑 কোড পান", 'en': "🔑 Get Code"},
+    'btn_check_details': {'bn': "📋 Agent Code দিয়ে ডিটেল চেক", 'en': "📋 Check Details via Agent Code"},
+    'btn_my_account': {'bn': "💰 আমার একাউন্ট", 'en': "💰 My Account"},
+    'btn_withdraw': {'bn': "💸 টাকা তুলুন (Withdraw)", 'en': "💸 Withdraw Money"},
+    'btn_update_info': {'bn': "(পাসওয়ার্ড & পেমেন্ট নম্বর পরিবর্তন)", 'en': "(Change Pass & Payment Info)"},
+    'btn_payment_status': {'bn': "📊 পেমেন্ট স্ট্যাটাস", 'en': "📊 Payment Status"},
+    'btn_offer_notice': {'bn': "🎁 অফার/নোটিশ", 'en': "🎁 Offer/Notice"},
+    'btn_fill_form': {'bn': "🔗 ফর্ম পূরণ করুন", 'en': "🔗 Fill Form"},
+    'btn_reset_pass': {'bn': "🔑 পাসওয়ার্ড রিসেট", 'en': "🔑 Reset Password"},
+    'btn_help': {'bn': "ℹ️ হেল্প", 'en': "ℹ️ Help"},
+    'btn_lang_change': {'bn': "🌐 Language / ভাষা", 'en': "🌐 Language / ভাষা"},
+    'btn_back': {'bn': "⬅️ ফিরে যান", 'en': "⬅️ Back"},
+    'welcome_verify': {'bn': "👋 হ্যালো!\n\nবট ব্যবহার করতে হলে আগে:\n1️⃣ Telegram Channel-এ Join করুন\n2️⃣ YouTube Channel-টি Subscribe করুন\n3️⃣ তারপর ✅ Verify বাটনে চাপুন", 'en': "👋 Hello!\n\nTo use the bot, first:\n1️⃣ Join Telegram Channel\n2️⃣ Subscribe YouTube Channel\n3️⃣ Then click ✅ Verify button"},
+    'verify_success': {'bn': "✅ ভেরিফিকেশন সফল হয়েছে!", 'en': "✅ Verification Successful!"},
+    'verify_fail': {'bn': "⚠️ আপনি এখনও চ্যানেলে জয়েন করেননি।", 'en': "⚠️ You haven't joined the channel yet."},
+    'main_menu': {'bn': "🎯 মেইন মেনু:", 'en': "🎯 Main Menu:"},
+    'blocked_msg': {'bn': "🚨 **আপনি ব্লকড** 🚨\n\nআপনার একাউন্ট ব্লক করা হয়েছে।\n**কারণ:** {reason}\nএডমিনের সাথে যোগাযোগ করুন।", 'en': "🚨 **YOU ARE BLOCKED** 🚨\n\nYour account has been blocked.\n**Reason:** {reason}\nContact Admin."},
+    'cancel_process': {'bn': "✅ প্রক্রিয়াটি বাতিল করা হয়েছে।", 'en': "✅ Process cancelled."},
+    'enter_gmail': {'bn': "🔑 আপনার রেজিস্টার্ড Gmail টি দিন:", 'en': "🔑 Enter your registered Gmail:"},
+    'invalid_gmail': {'bn': "⚠️ সঠিক ইমেইল দিন।", 'en': "⚠️ Enter a valid email."},
+    'gmail_not_found': {'bn': "❌ ইমেইল পাওয়া যায়নি। ফর্ম পূরণ করুন।", 'en': "❌ Email not found. Please fill the form."},
+    'your_code': {'bn': "✅ আপনার Agent Code: `{code}`", 'en': "✅ Your Agent Code: `{code}`"},
+    'set_pass_prompt': {'bn': "⚠️ পাসওয়ার্ড সেট নেই। ৫-৮ অক্ষরের পাসওয়ার্ড দিন:", 'en': "⚠️ No password set. Enter a 5-8 char password:"},
+    'pass_set_success': {'bn': "✅ পাসওয়ার্ড সেট করা হয়েছে।", 'en': "✅ Password set successfully."},
+    'enter_agent_code': {'bn': "💰 আপনার Agent Code টি দিন:", 'en': "💰 Enter your Agent Code:"},
+    'enter_pass': {'bn': "🔐 আপনার পাসওয়ার্ড দিন:", 'en': "🔐 Enter your Password:"},
+    'wrong_pass': {'bn': "❌ ভুল পাসওয়ার্ড।", 'en': "❌ Wrong Password."},
+    'code_not_found': {'bn': "❌ Agent Code পাওয়া যায়নি।", 'en': "❌ Agent Code not found."},
+    'current_balance': {'bn': "💰 আপনার বর্তমান ব্যালেন্স: `৳{balance}`", 'en': "💰 Your Current Balance: `৳{balance}`"},
+    'withdraw_prompt': {'bn': "💸 টাকা তোলার জন্য আপনার Agent Code টি দিন:", 'en': "💸 Enter Agent Code to Withdraw:"},
+    'pending_req': {'bn': "❌ আপনার একটি পেমেন্ট রিকোয়েস্ট পেন্ডিং আছে।", 'en': "❌ You have a pending payment request."},
+    'limit_reached': {'bn': "⚠️ লিমিট অতিক্রম! ২৪ ঘন্টায় একবার।", 'en': "⚠️ Limit Reached! Once in 24 hours."},
+    'min_withdraw': {'bn': "❌ ন্যূনতম ৳৫০ তুলতে পারবেন।", 'en': "❌ Minimum withdrawal is ৳50."},
+    'processing_msg': {'bn': "⏳ **আপনার রিকোয়েস্ট প্রসেসিং হচ্ছে...**", 'en': "⏳ **Processing your request...**"},
+    'req_sent_title': {'bn': "✅ **রিকোয়েস্ট সফলভাবে পাঠানো হয়েছে!**", 'en': "✅ **Request Sent Successfully!**"},
+    'warning_notice': {'bn': "⚠️ **জরুরি নোটিশ:**\n২৪ ঘন্টার মধ্যেই পেমেন্ট অ্যাপ্রুভ হবে। দয়া করে ২৪ ঘন্টার মধ্যে মেসেজ দিবেন না।\n\nযদি ২৪ ঘন্টা পার হয়, তবেই এডমিনের সাথে যোগাযোগ করুন।", 'en': "⚠️ **Important Notice:**\nPayment will be approved within 24 hours. Please do not message within 24 hours.\n\nContact Admin only after 24 hours."},
+    'admin_contact_btn': {'bn': "👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", 'en': "👨‍💻 Contact Admin"},
+    'payment_method_prompt': {'bn': "আপনি কোন মাধ্যমে টাকা নিতে চান?", 'en': "Which method do you want to use?"},
+    'confirm_req_msg': {'bn': "✅ আপনার ৳{amount} তোলার অনুরোধ পাঠানো হয়েছে। ৳{fee} ফি কেটে নেওয়ার পর আপনি **৳{receivable}** পাবেন।", 'en': "✅ Request for ৳{amount} sent. You will receive **৳{receivable}** after ৳{fee} fee."},
+    'confirm_req_msg_no_fee': {'bn': "✅ আপনার ৳{amount} তোলার অনুরোধ পাঠানো হয়েছে।", 'en': "✅ Request for ৳{amount} sent."}
+}
+
+try:
+    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    CREDS = ServiceAccountCredentials.from_json_keyfile_name(JSON_FILE, SCOPE)
+    client = gspread.authorize(CREDS)
+    user_sheet = client.open(SHEET_NAME).sheet1
+    logger.info("✅ Google Sheet successfully connected.")
+except Exception as e:
+    logger.critical(f"❌ Google Sheet connection failed: {e}")
+    exit()
+
+# --- Language Helper Functions ---
+def get_user_lang(user_id: int) -> str:
+    try:
+        cur.execute("SELECT language FROM verified_users WHERE user_id = ?", (user_id,))
+        res = cur.fetchone()
+        return res[0] if res else 'bn'
+    except Exception:
+        return 'bn'
+
+def set_user_lang(user_id: int, lang: str):
+    try:
+        cur.execute("INSERT OR IGNORE INTO verified_users (user_id, language) VALUES (?, ?)", (user_id, lang))
+        cur.execute("UPDATE verified_users SET language = ? WHERE user_id = ?", (lang, user_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error setting lang: {e}")
+
+def get_text(user_id: int, key: str, **kwargs) -> str:
+    lang = get_user_lang(user_id)
+    text_template = TRANS.get(key, {}).get(lang, TRANS[key]['bn']) # Fallback to Bangla
+    try:
+        return text_template.format(**kwargs)
+    except Exception:
+        return text_template
+# --- Standard Utils ---
+def delete_message_callback(context: CallbackContext):
+    try:
+        context.bot.delete_message(chat_id=context.job.context['chat_id'], message_id=context.job.context['message_id'])
+    except Exception as e:
+        logger.warning(f"Could not auto-delete message: {e}")
+
+def schedule_message_deletion(context: CallbackContext, message, user_id):
+    delay = ADMIN_DELETE_DELAY if is_admin(user_id) else USER_DELETE_DELAY
+    context.job_queue.run_once(
+        delete_message_callback,
+        delay,
+        context={'chat_id': message.chat_id, 'message_id': message.message_id}
+    )
+
+def reply_and_delete(update_or_query, context: CallbackContext, text: str, **kwargs):
+    chat = None; user_id = None
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        chat = update_or_query.message.chat; user_id = update_or_query.message.from_user.id
+        sent_message = chat.send_message(text, **kwargs)
+    elif hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat:
+        chat = update_or_query.effective_chat; user_id = update_or_query.effective_user.id
+        sent_message = chat.send_message(text, **kwargs)
+    else: return None
+
+    if not is_admin(user_id):
+        schedule_message_deletion(context, sent_message, user_id)
+    return sent_message
+
+# --- Database & Helper Functions ---
+def is_verified_db(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM verified_users WHERE user_id = ?", (user_id,))
+    return cur.fetchone() is not None
+
+def set_verified_db(user_id: int):
+    try: 
+        cur.execute("INSERT OR IGNORE INTO verified_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+    except Exception as e: logger.error(f"SQLite insert error: {e}")
+
+def is_blocked_db(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+    return cur.fetchone() is not None
+
+def get_blocked_reason(user_id: int) -> str:
+    cur.execute("SELECT reason FROM blocked_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    return row[0] if row else "N/A"
+
+def block_user_db(user_id: int, reason: str):
+    try:
+        cur.execute("INSERT OR REPLACE INTO blocked_users (user_id, reason, timestamp) VALUES (?, ?, ?)", 
+                    (user_id, reason, int(time.time())))
+        conn.commit()
+        logger.info(f"Blocked user {user_id} in DB for reason: {reason}")
+    except Exception as e:
+        logger.error(f"SQLite block user error: {e}")
+
+def unblock_user_db(user_id: int):
+    try:
+        cur.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        logger.info(f"Unblocked user {user_id} in DB")
+    except Exception as e:
+        logger.error(f"SQLite unblock user error: {e}")
+
+def get_fail_count(agent_code: str) -> int:
+    cur.execute("SELECT count FROM reset_fails WHERE agent_code = ?", (agent_code,))
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def increment_fail_count(agent_code: str):
+    count = get_fail_count(agent_code) + 1
+    cur.execute("INSERT OR REPLACE INTO reset_fails (agent_code, count) VALUES (?, ?)", (agent_code, count))
+    conn.commit()
+    return count
+
+def clear_fail_count(agent_code: str):
+    cur.execute("DELETE FROM reset_fails WHERE agent_code = ?", (agent_code,))
+    conn.commit()
+
+# --- Helper for Payment Methods ---
+def is_method_active(method_name: str) -> bool:
+    cur.execute("SELECT is_active FROM payment_methods WHERE method_name = ?", (method_name,))
+    row = cur.fetchone()
+    return row[0] == 1 if row else False
+
+def toggle_method_status(method_name: str):
+    current_status = is_method_active(method_name)
+    new_status = 0 if current_status else 1
+    cur.execute("UPDATE payment_methods SET is_active = ? WHERE method_name = ?", (new_status, method_name))
+    conn.commit()
+    return new_status
+
+def generate_unique_code(existing_codes, min_len=4, max_len=12):
+    for _ in range(2000):
+        length = random.randint(min_len, max_len)
+        code = "".join(random.choices("0123456789", k=length))
+        if code not in existing_codes: return code
+    return None
+
+def has_pending_request(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM payment_history WHERE user_id = ? AND status = '⏳ পেন্ডিং'", (user_id,))
+    return cur.fetchone() is not None
+
+def is_code_pending(agent_code: str) -> bool:
+    cur.execute("SELECT 1 FROM payment_history WHERE agent_code = ? AND status = '⏳ পেন্ডিং'", (agent_code,))
+    return cur.fetchone() is not None
+
+def get_last_approved_time(agent_code: str) -> int:
+    try:
+        cur.execute("SELECT MAX(timestamp) FROM payment_history WHERE agent_code = ? AND status = '✅ অ্যাপ্রুভড'", (agent_code,))
+        result = cur.fetchone()
+        return result[0] if result and result[0] else 0
+    except Exception as e:
+        logger.error(f"Error fetching last approved time: {e}")
+        return 0
+
+def is_admin(user_id: int) -> bool: return user_id in ADMIN_IDS
+
+def show_blocked_message(update_or_query, context: CallbackContext):
+    user_id = update_or_query.effective_user.id
+    reason = get_blocked_reason(user_id)
+    text = get_text(user_id, 'blocked_msg', reason=reason)
+    
+    keyboard = [[InlineKeyboardButton(get_text(user_id, 'admin_contact_btn'), url=f"tg://user?id={ADMIN_IDS[0]}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    chat = update_or_query.message.chat if hasattr(update_or_query, 'message') and update_or_query.message else update_or_query.effective_chat
+    if chat: chat.send_message(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    
+    if hasattr(update_or_query, 'callback_query') and update_or_query.callback_query:
+        try: update_or_query.callback_query.answer("❌ Blocked.", show_alert=True)
+        except Exception: pass
+
+def force_reverify(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    text = get_text(user_id, 'welcome_verify')
+    
+    user_state_buttons = [
+        [InlineKeyboardButton("📢 Join Telegram Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
+        [InlineKeyboardButton("📺 Subscribe YouTube Channel", url=YOUTUBE_LINK)],
+        [InlineKeyboardButton("✅ Verify", callback_data="verify_user")],
+    ]
+    reply_markup = InlineKeyboardMarkup(user_state_buttons)
+    
+    chat = update.message.chat if hasattr(update, 'message') and update.message else update.effective_chat
+    if chat: chat.send_message(text, reply_markup=reply_markup)
+
+def is_channel_member(user_id: int, context: CallbackContext) -> bool:
+    if is_admin(user_id): return True
+    try:
+        member = context.bot.get_chat_member(f"@{CHANNEL_USERNAME.lstrip('@')}", user_id)
+        if member.status in ["creator", "administrator", "member"]: return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking membership for {user_id}: {e}")
+        return False
+
+# --- MULTILINGUAL MENU ---
+def show_main_menu(update_or_query):
+    user_id = update_or_query.effective_user.id
+    
+    buttons = [
+        [KeyboardButton(get_text(user_id, 'btn_get_code')), KeyboardButton(get_text(user_id, 'btn_check_details'))],
+        [KeyboardButton(get_text(user_id, 'btn_my_account')), KeyboardButton(get_text(user_id, 'btn_withdraw'))],
+        [KeyboardButton(get_text(user_id, 'btn_update_info')), KeyboardButton(get_text(user_id, 'btn_payment_status'))],
+        [KeyboardButton(get_text(user_id, 'btn_offer_notice')), KeyboardButton(get_text(user_id, 'btn_fill_form'))],
+        [KeyboardButton(get_text(user_id, 'btn_reset_pass')), KeyboardButton(get_text(user_id, 'btn_help'))],
+        [KeyboardButton(get_text(user_id, 'btn_lang_change'))] # New Language Button
+    ]
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+    
+    chat = update_or_query.message.chat if hasattr(update_or_query, 'message') and update_or_query.message else update_or_query.effective_chat
+    if chat: chat.send_message(get_text(user_id, 'main_menu'), reply_markup=reply_markup)
+
+def show_full_admin_menu(update_or_query):
+    # Admin menu uses translated user buttons + static admin buttons
+    user_id = update_or_query.effective_user.id
+    
+    admin_buttons = [
+        [KeyboardButton("➕ টাকা এড করুন"), KeyboardButton("➕ বাল্ক টাকা এড")],
+        [KeyboardButton("⚙️ অন্যান্য অপশন")] 
+    ]
+    user_buttons = [
+        [KeyboardButton(get_text(user_id, 'btn_get_code')), KeyboardButton(get_text(user_id, 'btn_check_details'))],
+        [KeyboardButton(get_text(user_id, 'btn_my_account')), KeyboardButton(get_text(user_id, 'btn_withdraw'))],
+        [KeyboardButton(get_text(user_id, 'btn_update_info')), KeyboardButton(get_text(user_id, 'btn_payment_status'))],
+        [KeyboardButton(get_text(user_id, 'btn_offer_notice')), KeyboardButton(get_text(user_id, 'btn_fill_form'))],
+        [KeyboardButton(get_text(user_id, 'btn_reset_pass')), KeyboardButton(get_text(user_id, 'btn_help'))],
+        [KeyboardButton(get_text(user_id, 'btn_lang_change'))]
+    ]
+    full_menu = admin_buttons + user_buttons
+    reply_markup = ReplyKeyboardMarkup(full_menu, resize_keyboard=True, one_time_keyboard=False)
+    
+    chat = update_or_query.message.chat if hasattr(update_or_query, 'message') and update_or_query.message else update_or_query.effective_chat
+    if chat: chat.send_message("R2k tricks zone (Admin)", reply_markup=reply_markup)
+
+def show_all_admin_buttons(update, context):
+    if not is_admin(update.effective_user.id): return
+    other_admin_buttons = [
+        [KeyboardButton("➖ টাকা কমান"), KeyboardButton("🔍 ইউজার ডিটেলস")],
+        [KeyboardButton("📊 ইউজার সংখ্যা"), KeyboardButton("📢 ব্রডকাস্ট")],
+        [KeyboardButton("✍️ নোটিশ সেট করুন"), KeyboardButton("🚫 ব্লক করুন")],
+        [KeyboardButton("✅ আনব্লক করুন"), KeyboardButton("⚙️ পেমেন্ট মেথড কন্ট্রোল")],
+        [KeyboardButton("🔧 পেমেন্ট ফিক্স"), KeyboardButton("💰 জমার হিস্ট্রি")],
+        [KeyboardButton("🔙 মেইন মেনু")] 
+    ]
+    reply_markup = ReplyKeyboardMarkup(other_admin_buttons, resize_keyboard=True)
+    update.message.reply_text("⚙️ **অন্যান্য অ্যাডমিন অপশন:**", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+def back_to_main_admin_menu(update, context):
+    show_full_admin_menu(update)
+def start(update: Update, context: CallbackContext):
+    user = update.message.from_user
+    
+    if is_blocked_db(user.id):
+        show_blocked_message(update, context)
+        return
+    
+    if is_admin(user.id): show_full_admin_menu(update); return
+    
+    if is_verified_db(user.id):
+        if is_channel_member(user.id, context):
+            show_main_menu(update)
+            return
+        else:
+            force_reverify(update, context)
+            return
+
+    # First time user? Prompt for language or just verify
+    force_reverify(update, context)
+
+# --- LANGUAGE HANDLERS ---
+def lang_change_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    keyboard = [
+        [InlineKeyboardButton("বাংলা 🇧🇩", callback_data="setlang_bn"), 
+         InlineKeyboardButton("English 🇺🇸", callback_data="setlang_en")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Please select your language / অনুগ্রহ করে ভাষা নির্বাচন করুন:", reply_markup=reply_markup)
+
+def lang_selection_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    lang_code = query.data.split('_')[1] # 'bn' or 'en'
+    
+    set_user_lang(user_id, lang_code)
+    query.answer()
+    
+    confirm_text = "ভাষা বাংলায় পরিবর্তন করা হয়েছে।" if lang_code == 'bn' else "Language changed to English."
+    query.delete_message()
+    
+    if is_admin(user_id):
+        query.message.reply_text(confirm_text)
+        show_full_admin_menu(query)
+    else:
+        query.message.reply_text(confirm_text)
+        show_main_menu(query)
+
+def help_button_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return
+    if not is_channel_member(user_id, context): force_reverify(update, context); return
+
+    # Translation for help buttons
+    btn_rules = "🤖 বট ব্যবহারের নিয়ম" if get_user_lang(user_id) == 'bn' else "🤖 Bot Rules"
+    
+    keyboard = [
+        [InlineKeyboardButton(btn_rules, callback_data="show_help_rules")],
+        [InlineKeyboardButton("💵 টাকা তোলার নিয়ম", url="https://t.me/social_workars4/658")],
+        [InlineKeyboardButton("📝 ফর্ম পূরণের নিয়ম", url="https://youtu.be/Zpw6rZ3SK90?si=TqwvzFG5TTQJ8udL")],
+        [InlineKeyboardButton(get_text(user_id, 'admin_contact_btn'), url=f"tg://user?id={ADMIN_IDS[0]}")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(get_text(user_id, 'btn_help'), reply_markup=reply_markup)
+
+def show_help_rules(update: Update, context: CallbackContext):
+    query = update.callback_query; user_id = query.from_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return
+    
+    query.answer()
+    # Keeping help text static bilingual/bangla as per original request complexity
+    help_text = (
+        "✨ **বট ব্যবহারে সহায়তা / Bot Help** ✨\n\n"
+        "🔑 **এজেন্ট কোড**: ইমেইল দিয়ে কোড ও পাসওয়ার্ড সেট করুন।\n"
+        "📋 **প্রোফাইল**: ব্যালেন্স ও ডিটেলস চেক করুন।\n"
+        "💸 **উত্তোলন**: মিনিমাম ৳৫০ হলে টাকা তুলতে পারবেন।\n"
+        "🔄 **আপডেট**: পাসওয়ার্ড বা পেমেন্ট নম্বর বদলাতে পারবেন।"
+    )
+    query.edit_message_text(text=help_text, parse_mode=ParseMode.MARKDOWN)
+
+def handle_regular_message(update: Update, context: CallbackContext):
+    if not update.message or not update.message.text: return
+    text = update.message.text.strip(); user_id = update.message.from_user.id
+
+    if is_blocked_db(user_id): show_blocked_message(update, context); return
+    if not is_verified_db(user_id) and not is_admin(user_id): force_reverify(update, context); return
+    if not is_channel_member(user_id, context): force_reverify(update, context); return
+        
+    # Check against translated button text
+    if text == get_text(user_id, 'btn_fill_form'):
+        update.message.reply_text(f"📝 Form:\n{FORM_LINK}"); return
+    elif text == get_text(user_id, 'btn_lang_change'):
+        lang_change_start(update, context); return
+
+def cancel_and_show_menu(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    if is_blocked_db(user_id): return ConversationHandler.END
+
+    reply_and_delete(update, context, get_text(user_id, 'cancel_process'))
+    context.user_data.clear()
+    if is_admin(user_id): show_full_admin_menu(update)
+    else: show_main_menu(update)
+    return ConversationHandler.END
+    
+def verify_user(update: Update, context: CallbackContext):
+    query = update.callback_query; user_id = query.from_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return
+    
+    try:
+        member = context.bot.get_chat_member(f"@{CHANNEL_USERNAME.lstrip('@')}", user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            set_verified_db(user_id)
+            # Default to BN if not set
+            if get_user_lang(user_id) is None: set_user_lang(user_id, 'bn')
+            
+            query.answer(get_text(user_id, 'verify_success'), show_alert=True)
+            query.edit_message_text("✅ Verification Complete!")
+            show_main_menu(query)
+        else: query.answer(get_text(user_id, 'verify_fail'), show_alert=True)
+    except Exception as e: logger.error(f"get_chat_member error: {e}"); query.answer("⚠️ Error checking verification.", show_alert=True)
+
+def find_cell_robust(query, in_column, sheet_obj=user_sheet):
+    try:
+        values = sheet_obj.col_values(in_column, value_render_option='FORMATTED_VALUE')
+        cleaned_values = [val.strip("'") for val in values]
+        if query in cleaned_values:
+            row = cleaned_values.index(query) + 1
+            return gspread.Cell(row, in_column, value=query)
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error in find_cell_robust: {e}")
+        return None
+
+def get_password_and_proceed(update: Update, context: CallbackContext, next_state):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    user_id = update.message.from_user.id
+    
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell is None:
+        reply_and_delete(update, context, get_text(user_id, 'code_not_found'))
+        return cancel_and_show_menu(update, context)
+        
+    try:
+        status = user_sheet.cell(cell.row, STATUS_COL).value
+        if status == "Blocked":
+            reason = f"Accessing blocked code {agent_code}"
+            block_user_db(user_id, reason=reason)
+            show_blocked_message(update, context)
+            return cancel_and_show_menu(update, context)
+    except Exception: pass
+
+    password = user_sheet.cell(cell.row, PASSWORD_COL).value
+    if not password or not password.strip():
+        reply_and_delete(update, context, get_text(user_id, 'set_pass_prompt'))
+        return cancel_and_show_menu(update, context)
+    
+    # Save Agent Code for checks later
+    context.user_data.update({'agent_code': agent_code, 'row': cell.row, 'saved_password': password.strip("'")})
+    reply_and_delete(update, context, get_text(user_id, 'enter_pass'), reply_markup=BACK_KEYBOARD)
+    return next_state
+
+# --- GET CODE ---
+def get_code_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    if not is_channel_member(user_id, context): force_reverify(update, context); return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, user_id)
+    reply_and_delete(update, context, get_text(user_id, 'enter_gmail'), reply_markup=BACK_KEYBOARD)
+    return GET_CODE_GMAIL
+
+def handle_get_code_gmail(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    gmail = update.message.text.strip(); user_id = update.effective_user.id
+    
+    if is_blocked_db(user_id): show_blocked_message(update, context); return
+    if "@" not in gmail: reply_and_delete(update, context, get_text(user_id, 'invalid_gmail')); return GET_CODE_GMAIL
+    
+    cell = find_cell_robust(gmail, in_column=GMAIL_COL)
+    if cell is None:
+        update.message.reply_text(get_text(user_id, 'gmail_not_found') + f"\n{FORM_LINK}")
+        return cancel_and_show_menu(update, context)
+        
+    user_id_on_sheet = user_sheet.cell(cell.row, USER_ID_COL).value
+    if not user_id_on_sheet: user_sheet.update_cell(cell.row, USER_ID_COL, user_id)
+        
+    agent_code = user_sheet.cell(cell.row, AGENT_CODE_COL).value
+    password = user_sheet.cell(cell.row, PASSWORD_COL).value
+    
+    if agent_code and agent_code.strip():
+        update.message.reply_text(get_text(user_id, 'your_code', code=agent_code.strip()), parse_mode=ParseMode.MARKDOWN)
+        if not password or not password.strip():
+            reply_and_delete(update, context, get_text(user_id, 'set_pass_prompt'), reply_markup=BACK_KEYBOARD)
+            context.user_data['password_row'] = cell.row; return SET_NEW_PASSWORD
+        else: return cancel_and_show_menu(update, context)
+    else:
+        # Code generation logic
+        all_codes = set(filter(None, [c.strip() for c in user_sheet.col_values(AGENT_CODE_COL)]))
+        new_code = generate_unique_code(all_codes, 4, 12)
+        if new_code:
+            user_sheet.update_cell(cell.row, AGENT_CODE_COL, f"'{new_code}")
+            update.message.reply_text(get_text(user_id, 'your_code', code=new_code), parse_mode=ParseMode.MARKDOWN)
+            reply_and_delete(update, context, get_text(user_id, 'set_pass_prompt'), reply_markup=BACK_KEYBOARD)
+            context.user_data['password_row'] = cell.row; return SET_NEW_PASSWORD
+        else:
+            reply_and_delete(update, context, "⚠️ System Error."); return cancel_and_show_menu(update, context)
+
+def handle_set_new_password(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+
+    password = update.message.text.strip()
+    if not (5 <= len(password) <= 8):
+        reply_and_delete(update, context, get_text(user_id, 'set_pass_prompt'))
+        return SET_NEW_PASSWORD
+    
+    try:
+        user_sheet.update_cell(context.user_data['password_row'], PASSWORD_COL, f"'{password}")
+        reply_and_delete(update, context, get_text(user_id, 'pass_set_success'))
+    except Exception as e:
+        logger.error(f"Set new password error: {e}")
+        reply_and_delete(update, context, "⚠️ Error setting password.")
+    return cancel_and_show_menu(update, context)
+# --- BALANCE CHECK ---
+def balance_check_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    if not is_channel_member(user_id, context): force_reverify(update, context); return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, user_id)
+    reply_and_delete(update, context, get_text(user_id, 'enter_agent_code'), reply_markup=BACK_KEYBOARD)
+    return BALANCE_CHECK_CODE
+
+def handle_balance_check_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_BALANCE)
+
+def verify_password_for_balance(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    
+    if update.message.text.strip() == context.user_data['saved_password']:
+        row = context.user_data['row']
+        user_sheet.update_cell(row, USER_ID_COL, user_id) 
+        balance = user_sheet.cell(row, BALANCE_COL).value or "0"
+        reply_and_delete(update, context, get_text(user_id, 'current_balance', balance=balance), parse_mode=ParseMode.MARKDOWN)
+    else:
+        reply_and_delete(update, context, get_text(user_id, 'wrong_pass'))
+    return cancel_and_show_menu(update, context)
+
+# --- GET DETAILS ---
+def get_details_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    if not is_channel_member(user_id, context): force_reverify(update, context); return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, user_id)
+    reply_and_delete(update, context, get_text(user_id, 'enter_agent_code'), reply_markup=BACK_KEYBOARD)
+    return GET_DETAILS_CODE
+
+def handle_get_details_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_DETAILS)
+
+def verify_password_for_details(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+
+    password = update.message.text.strip()
+    if password == context.user_data['saved_password']:
+        row = context.user_data['row']
+        user_sheet.update_cell(row, USER_ID_COL, user_id)
+        row_data = user_sheet.row_values(row)
+        
+        def safe_get(index, r_data): return r_data[index].strip("'") if index < len(r_data) and str(r_data[index]).strip() else "N/A"
+        
+        # Bilingual Profile Labeling based on user language
+        lang = get_user_lang(user_id)
+        is_bn = lang == 'bn'
+        
+        lbl_profile = "📋 **Profile Details** 📋" if not is_bn else "📋 **প্রোফাইল ডিটেলস** 📋"
+        lbl_name = "Name" if not is_bn else "নাম"
+        lbl_bal = "Balance" if not is_bn else "ব্যালেন্স"
+        
+        reply_text = (
+            f"{lbl_profile}\n\n"
+            f"*Timestamp:* `{safe_get(TIMESTAMP_COL - 1, row_data)}`\n" 
+            f"📧 *Gmail:* `{safe_get(GMAIL_COL - 1, row_data)}`\n"
+            f"👤 *{lbl_name}:* `{safe_get(NAME_COL - 1, row_data)}`\n\n" 
+            f"📱 *WhatsApp:* `{safe_get(WHATSAPP_COL - 1, row_data)}`\n"
+            f"💬 *Telegram:* `{safe_get(TELEGRAM_COL - 1, row_data)}`\n\n" 
+            f"💳 *Bkash:* `{safe_get(BKASH_COL - 1, row_data)}`\n"
+            f"💳 *Nagad:* `{safe_get(NAGAD_COL - 1, row_data)}`\n" 
+            f"🏦 *Binance ID:* `{safe_get(BINANCE_COL - 1, row_data)}`\n\n"
+            f"🔑 **Agent Code:** `{safe_get(AGENT_CODE_COL - 1, row_data)}`\n" 
+            f"💰 **{lbl_bal}:** `৳{safe_get(BALANCE_COL - 1, row_data) or 0}`"
+        )
+        reply_and_delete(update, context, reply_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        reply_and_delete(update, context, get_text(user_id, 'wrong_pass'))
+    return cancel_and_show_menu(update, context)
+
+# --- ADMIN: ADD MONEY ---
+def add_money_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "টাকা যোগ করার জন্য ব্যবহারকারীর Agent Code দিন:", reply_markup=BACK_KEYBOARD)
+    return ADD_MONEY_CODE
+
+def add_money_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell:
+        context.user_data.update({'add_money_code': agent_code, 'add_money_row': cell.row})
+        reply_and_delete(update, context, "কত টাকা যোগ করতে চান? (যেমন: 50 বা +50):")
+        return ADD_MONEY_AMOUNT
+    else:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি।")
+        return ADD_MONEY_CODE
+
+def add_money_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    try:
+        amount = float(update.message.text.strip().lstrip('+'))
+        if amount <= 0: raise ValueError
+        context.user_data['amount_to_add'] = amount
+        reply_and_delete(update, context, "কিসের টাকা লিখুন:")
+        return GET_ADD_SOURCE
+    except ValueError:
+        reply_and_delete(update, context, "❌ সঠিক পরিমাণ দিন।")
+        return ADD_MONEY_AMOUNT
+def get_add_source(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['add_source'] = update.message.text
+    reply_and_delete(update, context, "কত তারিখের টাকা:")
+    return GET_ADD_DATE
+
+def get_add_date(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['add_date'] = update.message.text
+    reply_and_delete(update, context, "১ পিস কত টাকা করে:")
+    return GET_ADD_RATE
+
+def get_add_rate(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    rate = update.message.text
+    
+    row = context.user_data['add_money_row']
+    agent_code = context.user_data['add_money_code']
+    amount = context.user_data['amount_to_add']
+    source = context.user_data['add_source']
+    date = context.user_data['add_date']
+
+    try:
+        current_bal = float((user_sheet.cell(row, BALANCE_COL).value or "0").replace(',', ''))
+        new_bal = current_bal + amount
+        user_sheet.update_cell(row, BALANCE_COL, new_bal)
+        
+        cur.execute("INSERT INTO add_money_history (agent_code, amount, source, date_text, rate_text, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                    (agent_code, amount, source, date, rate, int(time.time())))
+        conn.commit()
+
+        reply_and_delete(update, context, f"✅ সফল! Agent: {agent_code}, Amount: ৳{amount}, New Balance: ৳{new_bal}")
+
+        # Notify User (Bilingual check)
+        target_uid_str = user_sheet.cell(row, USER_ID_COL).value
+        if target_uid_str and target_uid_str.isdigit():
+            target_uid = int(target_uid_str)
+            if not is_blocked_db(target_uid):
+                lang = get_user_lang(target_uid)
+                header = "🎉 **Money Added** 🎉" if lang == 'en' else "🎉 **টাকা যোগ হয়েছে** 🎉"
+                # Keep details static/mixed as they come from admin input
+                noti_text = (
+                    f"{header}\n\n"
+                    f"💰 Amount: ৳{amount}\n"
+                    f"📝 Source: {source}\n"
+                    f"📅 Date: {date}\n"
+                    f"💵 Rate: {rate}\n\n"
+                    f"🏦 Total Balance: ৳{new_bal}"
+                )
+                context.bot.send_message(target_uid, noti_text, parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        logger.error(f"Add money error: {e}")
+        reply_and_delete(update, context, "⚠️ Error updating balance.")
+    
+    context.user_data.clear()
+    show_full_admin_menu(update)
+    return ConversationHandler.END
+
+# --- ADMIN: BULK ADD ---
+def bulk_add_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    if context.user_data.get('bulk_metadata'):
+        d, s, r = context.user_data['bulk_metadata']
+        msg = f"💾 **Saved Data:**\nDate: `{d}`\nSource: `{s}`\nRate: `{r}`\n\nSend list: `Amount AgentCode`"
+        reply_and_delete(update, context, msg, parse_mode=ParseMode.MARKDOWN)
+        return BULK_PROCESS_LIST
+    else:
+        reply_and_delete(update, context, "Set Defaults: `Date / Source / Rate`", reply_markup=BACK_KEYBOARD)
+        return BULK_SETUP_DEFAULTS
+
+def handle_bulk_defaults(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    try:
+        d, s, r = [x.strip() for x in update.message.text.split('/')]
+        context.user_data['bulk_metadata'] = (d, s, r)
+        reply_and_delete(update, context, f"✅ Saved!\nNow send list: `Amount AgentCode`")
+        return BULK_PROCESS_LIST
+    except:
+        reply_and_delete(update, context, "❌ Format: `Date / Source / Rate`")
+        return BULK_SETUP_DEFAULTS
+
+def handle_bulk_process(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    text = update.message.text.strip()
+    
+    if text == "♻️ সেভ মেসেজ কিলিয়ার":
+        context.user_data.pop('bulk_metadata', None)
+        return bulk_add_start(update, context)
+
+    if not context.user_data.get('bulk_metadata'): return bulk_add_start(update, context)
+    
+    date, source, rate = context.user_data['bulk_metadata']
+    lines = text.split('\n')
+    report = "📋 Report:\n"
+    
+    for line in lines:
+        if not line.strip(): continue
+        try:
+            parts = line.split()
+            amount = float(parts[0])
+            code = parts[-1]
+            
+            cell = find_cell_robust(code, in_column=AGENT_CODE_COL)
+            if cell:
+                curr = float((user_sheet.cell(cell.row, BALANCE_COL).value or "0").replace(',',''))
+                new_b = curr + amount
+                user_sheet.update_cell(cell.row, BALANCE_COL, new_b)
+                
+                cur.execute("INSERT INTO add_money_history (agent_code, amount, source, date_text, rate_text, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                            (code, amount, source, date, rate, int(time.time())))
+                conn.commit()
+                report += f"✅ {code}: +{amount}\n"
+                
+                # Notify User (Bilingual)
+                uid_str = user_sheet.cell(cell.row, USER_ID_COL).value
+                if uid_str and uid_str.isdigit():
+                    u_id = int(uid_str)
+                    if not is_blocked_db(u_id):
+                        lang = get_user_lang(u_id)
+                        header = "🎉 **Money Added**" if lang == 'en' else "🎉 **টাকা যোগ হয়েছে**"
+                        context.bot.send_message(u_id, f"{header}\nAmount: ৳{amount}\nBal: ৳{new_b}", parse_mode=ParseMode.MARKDOWN)
+            else:
+                report += f"❌ {code}: Not Found\n"
+        except:
+            report += f"❌ Error: {line}\n"
+            
+    if len(report) > 4000: update.message.reply_text(report[:4000])
+    else: update.message.reply_text(report)
+    return BULK_PROCESS_LIST
+
+# --- ADMIN: SUBTRACT MONEY ---
+def subtract_money_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "টাকা কমানোর জন্য Agent Code দিন:", reply_markup=BACK_KEYBOARD)
+    return SUBTRACT_MONEY_CODE
+
+def subtract_money_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell:
+        bal = float((user_sheet.cell(cell.row, BALANCE_COL).value or "0").replace(',', ''))
+        context.user_data.update({'sub_code': agent_code, 'sub_row': cell.row, 'sub_bal': bal})
+        reply_and_delete(update, context, f"বর্তমান ব্যালেন্স: ৳{bal}\nকত টাকা কমাতে চান?")
+        return SUBTRACT_MONEY_AMOUNT
+    else:
+        reply_and_delete(update, context, "❌ Agent Code পাওয়া যায়নি।")
+        return SUBTRACT_MONEY_CODE
+
+def subtract_money_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    try:
+        amount = float(update.message.text.strip())
+        if amount > context.user_data['sub_bal']: raise ValueError
+        
+        row = context.user_data['sub_row']
+        new_bal = context.user_data['sub_bal'] - amount
+        user_sheet.update_cell(row, BALANCE_COL, new_bal)
+        
+        reply_and_delete(update, context, f"✅ কমানো হয়েছে: ৳{amount}\nনতুন ব্যালেন্স: ৳{new_bal}")
+        
+        # Notify User (Bilingual)
+        uid_str = user_sheet.cell(row, USER_ID_COL).value
+        if uid_str and uid_str.isdigit():
+            u_id = int(uid_str)
+            if not is_blocked_db(u_id):
+                lang = get_user_lang(u_id)
+                msg = f"🚨 Admin deducted ৳{amount}.\nNew Balance: ৳{new_bal}" if lang == 'en' else f"🚨 অ্যাডমিন ৳{amount} কমিয়েছে।\nনতুন ব্যালেন্স: ৳{new_bal}"
+                context.bot.send_message(u_id, msg)
+                
+    except:
+        reply_and_delete(update, context, "❌ ভুল ইনপুট বা অপর্যাপ্ত ব্যালেন্স।")
+        return SUBTRACT_MONEY_AMOUNT
+    
+    context.user_data.clear()
+    show_full_admin_menu(update)
+    return ConversationHandler.END
+
+# --- UPDATE INFO ---
+def update_info_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    if not is_channel_member(user_id, context): force_reverify(update, context); return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, user_id)
+    reply_and_delete(update, context, get_text(user_id, 'enter_agent_code'), reply_markup=BACK_KEYBOARD)
+    return UPDATE_INFO_CODE
+
+def handle_update_info_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_UPDATE)
+
+def verify_password_for_update(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    
+    if update.message.text.strip() != context.user_data['saved_password']:
+        reply_and_delete(update, context, get_text(user_id, 'wrong_pass'))
+        return cancel_and_show_menu(update, context)
+    
+    row = context.user_data['row']
+    user_sheet.update_cell(row, USER_ID_COL, user_id)
+    context.user_data['update_info_row'] = row
+    
+    # Bilingual Buttons
+    is_bn = get_user_lang(user_id) == 'bn'
+    btn_pass = "🔐 পাসওয়ার্ড" if is_bn else "🔐 Password"
+    btn_bkash = "💳 বিকাশ" if is_bn else "💳 Bkash"
+    btn_nagad = "💳 নগদ" if is_bn else "💳 Nagad"
+    btn_binance = "🏦 Binance"
+    
+    keyboard = [
+        [InlineKeyboardButton(btn_pass, callback_data=f"update_{PASSWORD_COL}_Password")],
+        [InlineKeyboardButton(btn_bkash, callback_data=f"update_{BKASH_COL}_Bkash")],
+        [InlineKeyboardButton(btn_nagad, callback_data=f"update_{NAGAD_COL}_Nagad")],
+        [InlineKeyboardButton(btn_binance, callback_data=f"update_{BINANCE_COL}_Binance")]
+    ]
+    
+    prompt = "আপনি কোন তথ্যটি পরিবর্তন করতে চান?" if is_bn else "What info do you want to change?"
+    reply_and_delete(update, context, prompt, reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_INFO_FIELD
+
+def update_info_choose_field(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    query.answer()
+    
+    _, col, name = query.data.split('_')
+    context.user_data.update({'up_col': int(col), 'up_name': name})
+    
+    schedule_message_deletion(context, query.message, user_id)
+    
+    lang = get_user_lang(user_id)
+    if int(col) == PASSWORD_COL:
+        msg = "নতুন ৫-৮ অক্ষরের পাসওয়ার্ড দিন:" if lang == 'bn' else "Enter new 5-8 char password:"
+    else:
+        msg = f"নতুন {name} নম্বর/আইডি দিন:" if lang == 'bn' else f"Enter new {name} Number/ID:"
+        
+    reply_and_delete(query, context, msg, parse_mode=ParseMode.MARKDOWN)
+    return GET_NEW_INFO
+
+def update_info_get_new_value(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    
+    new_val = update.message.text.strip()
+    row = context.user_data['update_info_row']
+    col = context.user_data['up_col']
+    
+    if col == PASSWORD_COL and not (5 <= len(new_val) <= 8):
+        reply_and_delete(update, context, "❌ 5-8 chars required.")
+        return GET_NEW_INFO
+        
+    try:
+        val = f"'{new_val}" if col not in [BALANCE_COL, USER_ID_COL] else new_val
+        user_sheet.update_cell(row, col, val)
+        msg = "✅ সফলভাবে আপডেট হয়েছে।" if get_user_lang(user_id) == 'bn' else "✅ Updated Successfully."
+        reply_and_delete(update, context, msg)
+    except Exception as e:
+        logger.error(f"Update error: {e}")
+        reply_and_delete(update, context, "❌ Error.")
+        
+    context.user_data.clear()
+    show_main_menu(update)
+    return ConversationHandler.END
+# --- WITHDRAWAL ---
+def withdraw_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+    if not is_channel_member(user_id, context): force_reverify(update, context); return ConversationHandler.END
+    
+    if has_pending_request(user_id):
+        reply_and_delete(update, context, get_text(user_id, 'pending_req'))
+        return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, user_id)
+    reply_and_delete(update, context, get_text(user_id, 'withdraw_prompt'), reply_markup=BACK_KEYBOARD)
+    return WITHDRAW_CODE
+
+def handle_withdraw_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_WITHDRAW)
+
+def verify_password_for_withdraw(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id): show_blocked_message(update, context); return ConversationHandler.END
+
+    agent_code = context.user_data.get('agent_code')
+
+    # 1. Check Pending on Agent Code
+    if agent_code and is_code_pending(agent_code):
+        reply_and_delete(update, context, get_text(user_id, 'pending_req'))
+        return cancel_and_show_menu(update, context)
+
+    # 2. Check 24-Hour Limit
+    if agent_code:
+        last_time = get_last_approved_time(agent_code)
+        if int(time.time()) - last_time < 86400:
+            reply_and_delete(update, context, get_text(user_id, 'limit_reached'))
+            return cancel_and_show_menu(update, context)
+
+    # Password Check
+    if update.message.text.strip() != context.user_data['saved_password']:
+        reply_and_delete(update, context, get_text(user_id, 'wrong_pass'))
+        return cancel_and_show_menu(update, context)
+    
+    row = context.user_data['row']
+    user_sheet.update_cell(row, USER_ID_COL, user_id)
+    details = user_sheet.row_values(row)
+    balance = float((details[BALANCE_COL - 1] if len(details) >= BALANCE_COL else "0").replace(',', ''))
+    
+    if balance < 50:
+        reply_and_delete(update, context, get_text(user_id, 'min_withdraw'))
+        return cancel_and_show_menu(update, context)
+    
+    context.user_data.update({'w_code': agent_code, 'w_bal': balance, 'w_details': details})
+    
+    # Method Selection
+    keyboard = [
+        [InlineKeyboardButton("💳 Bkash/বিকাশ", callback_data="w_Bkash")],
+        [InlineKeyboardButton("💳 Nagad/নগদ", callback_data="w_Nagad")],
+        [InlineKeyboardButton("🚀 Rocket/রকেট", callback_data="w_Rocket")],
+        [InlineKeyboardButton("🏦 Binance", callback_data="w_Binance")]
+    ]
+    reply_and_delete(update, context, get_text(user_id, 'payment_method_prompt'), reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_METHOD
+
+def withdraw_choose_method(update: Update, context: CallbackContext):
+    query = update.callback_query; user_id = query.from_user.id
+    query.answer()
+    
+    _, method = query.data.split('_')
+    if not is_method_active(method):
+        reply_and_delete(query, context, "⚠️ Method maintenance/off.")
+        return CHOOSE_METHOD
+
+    context.user_data['w_method'] = method
+    schedule_message_deletion(context, query.message, user_id)
+    
+    # Auto-fill number if exists
+    col_map = {'Bkash': BKASH_COL, 'Nagad': NAGAD_COL, 'Binance': BINANCE_COL}
+    saved_num = ""
+    if method in col_map:
+        idx = col_map[method] - 1
+        details = context.user_data['w_details']
+        saved_num = details[idx].strip("'") if len(details) > idx else ""
+
+    if saved_num:
+        context.user_data['w_num'] = saved_num
+        kb = [[InlineKeyboardButton(f"✅ {saved_num}", callback_data="use_saved")], 
+              [InlineKeyboardButton("✏️ Change", callback_data="change_num")]]
+        reply_and_delete(query, context, f"Use saved {method}?", reply_markup=InlineKeyboardMarkup(kb))
+        return ASK_AMOUNT
+    else:
+        reply_and_delete(query, context, f"Enter {method} Number/ID:", reply_markup=BACK_KEYBOARD)
+        return GET_TEMP_NUMBER
+
+def withdraw_confirm_number(update: Update, context: CallbackContext):
+    query = update.callback_query; user_id = query.from_user.id
+    query.answer()
+    schedule_message_deletion(context, query.message, user_id)
+    
+    if query.data == "use_saved":
+        reply_and_delete(query, context, "Enter Amount:", reply_markup=BACK_KEYBOARD)
+        return ASK_AMOUNT
+    else:
+        reply_and_delete(query, context, "Enter Number:", reply_markup=BACK_KEYBOARD)
+        return GET_TEMP_NUMBER
+
+def withdraw_get_temp_number(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['w_num'] = f"'{update.message.text.strip()}"
+    reply_and_delete(update, context, "Enter Amount:", reply_markup=BACK_KEYBOARD)
+    return ASK_AMOUNT
+
+def withdraw_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_id = update.effective_user.id
+    
+    try:
+        amount = float(update.message.text.strip())
+        if amount < 50: reply_and_delete(update, context, get_text(user_id, 'min_withdraw')); return ASK_AMOUNT
+        if amount > context.user_data['w_bal']: reply_and_delete(update, context, "❌ Low Balance."); return ASK_AMOUNT
+    except:
+        reply_and_delete(update, context, "❌ Invalid Amount.")
+        return ASK_AMOUNT
+    
+    context.user_data['w_amount'] = amount
+    method = context.user_data['w_method']
+    
+    # 1. PERMANENT MESSAGE (Fee Calc)
+    fee, receivable = (WITHDRAWAL_FEE, amount - WITHDRAWAL_FEE) if method in ['Bkash', 'Nagad'] else (0, amount)
+    
+    if fee > 0:
+        conf_msg = get_text(user_id, 'confirm_req_msg', amount=amount, fee=fee, receivable=receivable)
+    else:
+        conf_msg = get_text(user_id, 'confirm_req_msg_no_fee', amount=amount)
+        
+    context.bot.send_message(user_id, conf_msg, parse_mode=ParseMode.MARKDOWN)
+
+    # 2. TEMPORARY MESSAGE (Warning + Animation)
+    msg = context.bot.send_message(user_id, get_text(user_id, 'processing_msg'), parse_mode=ParseMode.MARKDOWN)
+    time.sleep(1)
+    
+    final_warn = (
+        f"{get_text(user_id, 'req_sent_title')}\n\n"
+        f"{get_text(user_id, 'warning_notice')}\n"
+        f"👮‍♂️ **Admin ID:** `{ADMIN_IDS[0]}`"
+    )
+    btn_text = get_text(user_id, 'admin_contact_btn')
+    kb = [[InlineKeyboardButton(btn_text, url=f"tg://user?id={ADMIN_IDS[0]}")]]
+    
+    try:
+        # Edit the processing message to final warning
+        sent_w = context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, 
+                                      text=final_warn, reply_markup=InlineKeyboardMarkup(kb), 
+                                      parse_mode=ParseMode.MARKDOWN)
+        context.user_data['u_msg_id'] = sent_w.message_id
+    except:
+        # Fallback if edit fails
+        sent_w = context.bot.send_message(user_id, final_warn, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        context.user_data['u_msg_id'] = sent_w.message_id
+
+    send_request_to_admin(update, context)
+    context.user_data.clear()
+    show_main_menu(update)
+    return ConversationHandler.END
+
+def send_request_to_admin(update, context):
+    ud = context.user_data
+    uid = update.effective_user.id
+    amt = ud['w_amount']
+    code = ud['w_code']
+    msg_id = ud.get('u_msg_id')
+    
+    req_id = f"{uid}_{int(time.time())}"
+    
+    # Save to DB
+    cur.execute("INSERT INTO payment_history (request_id, user_id, agent_code, status, amount, timestamp, user_message_id) VALUES (?,?,?,?,?,?,?)",
+                (req_id, uid, code, "⏳ পেন্ডিং", amt, int(time.time()), msg_id))
+    conn.commit()
+    
+    # Admin Msg
+    txt = f"⚠️ **New Request**\nUser: `{uid}`\nCode: `{code}`\nAmt: `{amt}`\nMethod: `{ud['w_method']}`\nNum: `{ud['w_num']}`"
+    cb_pay = f"pay:{req_id}:{code}:{amt}:{uid}"
+    cb_cancel = f"cancel:{req_id}:{code}:{amt}:{uid}"
+    kb = [[InlineKeyboardButton("✅ Pay", callback_data=cb_pay), InlineKeyboardButton("❌ Cancel", callback_data=cb_cancel)]]
+    
+    refs = []
+    for admin in ADMIN_IDS:
+        try:
+            m = context.bot.send_message(admin, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            refs.append((admin, m.message_id))
+        except: pass
+        
+    context.bot_data.setdefault('w_reqs', {})[req_id] = refs
+
+def handle_payment_action(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    try: action, req_id, code, amt_s, uid_s = query.data.split(':')
+    except: return
+    
+    uid = int(uid_s)
+    amt = float(amt_s)
+    
+    if action == 'cancel':
+        # Auto delete user warning message
+        try:
+            cur.execute("SELECT user_message_id FROM payment_history WHERE request_id=?", (req_id,))
+            res = cur.fetchone()
+            if res and res[0]: context.bot.delete_message(uid, res[0])
+        except: pass
+        
+        cur.execute("UPDATE payment_history SET status=? WHERE request_id=?", ("❌ Cancelled", req_id))
+        conn.commit()
+        if not is_blocked_db(uid): context.bot.send_message(uid, f"❌ Request for ৳{amt} cancelled.")
+        query.edit_message_text(f"❌ Cancelled by Admin.")
+        
+    elif action == 'pay':
+        cell = find_cell_robust(code, in_column=AGENT_CODE_COL)
+        if cell:
+            curr = float((user_sheet.cell(cell.row, BALANCE_COL).value or "0").replace(',',''))
+            if curr < amt:
+                query.edit_message_text("⚠️ Low Balance in Sheet!")
+                return
+                
+            user_sheet.update_cell(cell.row, BALANCE_COL, curr - amt)
+            
+            # Auto delete user warning message
+            try:
+                cur.execute("SELECT user_message_id FROM payment_history WHERE request_id=?", (req_id,))
+                res = cur.fetchone()
+                if res and res[0]: context.bot.delete_message(uid, res[0])
+            except: pass
+            
+            # Update DB timestamp for 24h limit
+            cur.execute("UPDATE payment_history SET status=?, timestamp=? WHERE request_id=?", ("✅ Approved", int(time.time()), req_id))
+            conn.commit()
+            
+            if not is_blocked_db(uid): context.bot.send_message(uid, f"✅ Payment of ৳{amt} Approved!")
+            query.edit_message_text(f"✅ Paid ৳{amt} to {code}.")
+
+# --- MAIN ---
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True, workers=32)
+    dp = updater.dispatcher
+    
+    # Filters
+    back_filter = Filters.regex(f'^{BACK_BUTTON_TEXT}$') | Filters.regex('^⬅️ ফিরে যান$') | Filters.regex('^⬅️ Back$')
+    
+    # Handlers
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CallbackQueryHandler(lang_selection_callback, pattern='^setlang_'))
+    
+    # User Menu Handlers (Regex matched against TRANS dict values)
+    # Note: Regex needs to match both BN and EN for robustness
+    dp.add_handler(MessageHandler(Filters.regex('^(🔑 কোড পান|🔑 Get Code)$'), get_code_start))
+    dp.add_handler(MessageHandler(Filters.regex('^(💰 আমার একাউন্ট|💰 My Account)$'), balance_check_start))
+    dp.add_handler(MessageHandler(Filters.regex('^(📋 Agent Code দিয়ে ডিটেল চেক|📋 Check Details.*)$'), get_details_start))
+    dp.add_handler(MessageHandler(Filters.regex('^(💸 টাকা তুলুন.*|💸 Withdraw Money)$'), withdraw_start))
+    dp.add_handler(MessageHandler(Filters.regex('^(\(পাসওয়ার্ড & পেমেন্ট.*\)|.*Change Pass.*)$'), update_info_start))
+    dp.add_handler(MessageHandler(Filters.regex('^(ℹ️ হেল্প|ℹ️ Help)$'), help_button_handler))
+    
+    # Admin Handlers
+    dp.add_handler(MessageHandler(Filters.regex('^➕ টাকা এড করুন$'), add_money_start))
+    dp.add_handler(MessageHandler(Filters.regex('^➕ বাল্ক টাকা এড$'), bulk_add_start))
+    dp.add_handler(MessageHandler(Filters.regex('^➖ টাকা কমান$'), subtract_money_start))
+    dp.add_handler(MessageHandler(Filters.regex('^⚙️ অন্যান্য অপশন$'), show_all_admin_buttons))
+    dp.add_handler(MessageHandler(Filters.regex('^🔙 মেইন মেনু$'), back_to_main_admin_menu))
+
+    # Conv Handlers
+    conv_base = [MessageHandler(back_filter, cancel_and_show_menu)]
+    
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^(🔑 কোড পান|🔑 Get Code)$'), get_code_start)],
+        states={GET_CODE_GMAIL: [MessageHandler(Filters.text & ~back_filter, handle_get_code_gmail)], 
+                SET_NEW_PASSWORD: [MessageHandler(Filters.text & ~back_filter, handle_set_new_password)]},
+        fallbacks=conv_base
+    ))
+    
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^(💰 আমার একাউন্ট|💰 My Account)$'), balance_check_start)],
+        states={BALANCE_CHECK_CODE: [MessageHandler(Filters.text & ~back_filter, handle_balance_check_code)], 
+                VERIFY_PASS_FOR_BALANCE: [MessageHandler(Filters.text & ~back_filter, verify_password_for_balance)]},
+        fallbacks=conv_base
+    ))
+    
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^(📋 Agent Code দিয়ে ডিটেল চেক|📋 Check Details.*)$'), get_details_start)],
+        states={GET_DETAILS_CODE: [MessageHandler(Filters.text & ~back_filter, handle_get_details_code)], 
+                VERIFY_PASS_FOR_DETAILS: [MessageHandler(Filters.text & ~back_filter, verify_password_for_details)]},
+        fallbacks=conv_base
+    ))
+
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^(💸 টাকা তুলুন.*|💸 Withdraw Money)$'), withdraw_start)],
+        states={
+            WITHDRAW_CODE: [MessageHandler(Filters.text & ~back_filter, handle_withdraw_code)],
+            VERIFY_PASS_FOR_WITHDRAW: [MessageHandler(Filters.text & ~back_filter, verify_password_for_withdraw)],
+            CHOOSE_METHOD: [CallbackQueryHandler(withdraw_choose_method, pattern='^w_')],
+            ASK_AMOUNT: [CallbackQueryHandler(withdraw_confirm_number, pattern='^(use_saved|change_num)$'), 
+                         MessageHandler(Filters.text & ~back_filter, withdraw_get_amount)],
+            GET_TEMP_NUMBER: [MessageHandler(Filters.text & ~back_filter, withdraw_get_temp_number)]
+        },
+        fallbacks=conv_base
+    ))
+
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^(\(পাসওয়ার্ড & পেমেন্ট.*\)|.*Change Pass.*)$'), update_info_start)],
+        states={
+            UPDATE_INFO_CODE: [MessageHandler(Filters.text & ~back_filter, handle_update_info_code)],
+            VERIFY_PASS_FOR_UPDATE: [MessageHandler(Filters.text & ~back_filter, verify_password_for_update)],
+            CHOOSE_INFO_FIELD: [CallbackQueryHandler(update_info_choose_field, pattern='^update_')],
+            GET_NEW_INFO: [MessageHandler(Filters.text & ~back_filter, update_info_get_new_value)]
+        },
+        fallbacks=conv_base
+    ))
+
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^➕ টাকা এড করুন$'), add_money_start)],
+        states={
+            ADD_MONEY_CODE: [MessageHandler(Filters.text & ~back_filter, add_money_get_code)],
+            ADD_MONEY_AMOUNT: [MessageHandler(Filters.text & ~back_filter, add_money_get_amount)],
+            GET_ADD_SOURCE: [MessageHandler(Filters.text & ~back_filter, get_add_source)],
+            GET_ADD_DATE: [MessageHandler(Filters.text & ~back_filter, get_add_date)],
+            GET_ADD_RATE: [MessageHandler(Filters.text & ~back_filter, get_add_rate)]
+        },
+        fallbacks=conv_base
+    ))
+
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^➕ বাল্ক টাকা এড$'), bulk_add_start)],
+        states={
+            BULK_SETUP_DEFAULTS: [MessageHandler(Filters.text & ~back_filter, handle_bulk_defaults)],
+            BULK_PROCESS_LIST: [MessageHandler(Filters.text & ~back_filter, handle_bulk_process)]
+        },
+        fallbacks=conv_base
+    ))
+
+    dp.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^➖ টাকা কমান$'), subtract_money_start)],
+        states={
+            SUBTRACT_MONEY_CODE: [MessageHandler(Filters.text & ~back_filter, subtract_money_get_code)],
+            SUBTRACT_MONEY_AMOUNT: [MessageHandler(Filters.text & ~back_filter, subtract_money_get_amount)]
+        },
+        fallbacks=conv_base
+    ))
+    
+    # Callback Handlers
+    dp.add_handler(CallbackQueryHandler(verify_user, pattern="^verify_user$"))
+    dp.add_handler(CallbackQueryHandler(show_help_rules, pattern="^show_help_rules$"))
+    dp.add_handler(CallbackQueryHandler(handle_payment_action, pattern="^(pay|cancel):"))
+    
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_regular_message))
+    
+    logger.info("🤖 Bot running...")
+    updater.start_polling(); updater.idle()
+
+if __name__ == "__main__":
+    main()
