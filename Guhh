@@ -1,0 +1,2199 @@
+# bot.py
+import re
+import random
+import logging
+import sqlite3
+import time
+import json
+from datetime import datetime, time as time_obj
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler,
+    CallbackQueryHandler,
+)
+
+# ---------------- CONFIG ----------------
+JSON_FILE = "facebook-id-sell-472908-d5b92198cefe.json"
+SHEET_NAME = "এজেন্ট কোড নিয়ে কাজ শুরু করে দিন⌛🕡 (Responses)"
+BOT_TOKEN = "8158483330:AAGPRVkLfFdfeHE26F-QTab3I8jK5ym7qGU"
+CHANNEL_USERNAME = "@social_workars4"
+YOUTUBE_LINK = "https://youtube.com/@r2ktrackszone?si=TqwvzFG5TTQJ8udL"
+FORM_LINK = "https://forms.gle/JgNQuUdBG9iSAoDP7"
+ADMIN_IDS = [8016687898]
+WITHDRAWAL_FEE = 5
+PRIVATE_CHANNEL_ID = -1003014229156
+ADMIN_DELETE_DELAY = 10
+USER_DELETE_DELAY = 60
+
+# --- Google Sheet Column Config (1-indexed) ---
+TIMESTAMP_COL=1; GMAIL_COL=2; NAME_COL=3; WHATSAPP_COL=4; TELEGRAM_COL=5
+BKASH_COL=6; NAGAD_COL=7; BINANCE_COL=8; AGENT_CODE_COL=9; BALANCE_COL=10
+PASSWORD_COL = 11; USER_ID_COL = 12
+STATUS_COL = 13
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+conn = sqlite3.connect("bot_state.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS verified_users (user_id INTEGER PRIMARY KEY)""")
+
+# Updated table with agent_code and user_message_id
+cur.execute("""CREATE TABLE IF NOT EXISTS payment_history (
+    request_id TEXT PRIMARY KEY, 
+    user_id INTEGER, 
+    agent_code TEXT,
+    status TEXT, 
+    amount REAL, 
+    timestamp INTEGER,
+    user_message_id INTEGER
+)""")
+
+# Database Migration to ensure columns exist
+try:
+    cur.execute("ALTER TABLE payment_history ADD COLUMN agent_code TEXT")
+except sqlite3.OperationalError:
+    pass 
+
+try:
+    cur.execute("ALTER TABLE payment_history ADD COLUMN user_message_id INTEGER")
+except sqlite3.OperationalError:
+    pass
+
+cur.execute("""CREATE TABLE IF NOT EXISTS blocked_users (
+    user_id INTEGER PRIMARY KEY, 
+    reason TEXT, 
+    timestamp INTEGER
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS reset_fails (
+    agent_code TEXT PRIMARY KEY, 
+    count INTEGER
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS payment_methods (
+    method_name TEXT PRIMARY KEY,
+    is_active INTEGER DEFAULT 1
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS add_money_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_code TEXT,
+    amount REAL,
+    source TEXT,
+    date_text TEXT,
+    rate_text TEXT,
+    timestamp INTEGER
+)""")
+
+# Initialize methods if not exists
+for method in ['Bkash', 'Nagad', 'Rocket', 'Binance']:
+    cur.execute("INSERT OR IGNORE INTO payment_methods (method_name, is_active) VALUES (?, 1)", (method,))
+conn.commit()
+
+# --- Conversation States ---
+ADD_MONEY_CODE, ADD_MONEY_AMOUNT, GET_ADD_SOURCE, GET_ADD_DATE, GET_ADD_RATE = range(5)
+WITHDRAW_CODE, VERIFY_PASS_FOR_WITHDRAW, CHOOSE_METHOD, ASK_AMOUNT, GET_TEMP_NUMBER = range(5, 10)
+SUBTRACT_MONEY_CODE, SUBTRACT_MONEY_AMOUNT = range(10, 12)
+UPDATE_INFO_CODE, VERIFY_PASS_FOR_UPDATE, CHOOSE_INFO_FIELD, GET_NEW_INFO = range(12, 16)
+BALANCE_CHECK_CODE, VERIFY_PASS_FOR_BALANCE = range(16, 18)
+GET_DETAILS_CODE, VERIFY_PASS_FOR_DETAILS = range(18, 20)
+GET_CODE_GMAIL, SET_NEW_PASSWORD = range(20, 22)
+ADMIN_GET_DETAILS_CODE = 22
+CHOOSE_CANCEL_OPTION, GET_CANCEL_REASON = range(23, 25)
+BROADCAST_MESSAGE, BROADCAST_CONFIRM = range(25, 27)
+SET_NOTICE_TEXT = 27
+BLOCK_USER_CODE, BLOCK_USER_REASON, UNBLOCK_USER_CODE = range(28, 31)
+RESET_CODE, RESET_VERIFY, RESET_NEW_PASS = range(31, 34)
+METHOD_CONTROL = 34
+FIX_PAYMENT_CODE = 35
+VIEW_ADD_HISTORY_CODE = 36
+# --- UPDATED STATES FOR BULK ---
+BULK_SETUP_DEFAULTS, BULK_PROCESS_LIST = range(37, 39)
+
+BACK_BUTTON_TEXT = "⬅️ ফিরে যান"
+BACK_KEYBOARD = ReplyKeyboardMarkup([[KeyboardButton(BACK_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=True)
+        
+try:
+    SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    CREDS = ServiceAccountCredentials.from_json_keyfile_name(JSON_FILE, SCOPE)
+    client = gspread.authorize(CREDS)
+    user_sheet = client.open(SHEET_NAME).sheet1
+    logger.info("✅ Google Sheet successfully connected.")
+except Exception as e:
+    logger.critical(f"❌ Google Sheet connection failed: {e}")
+    exit()
+
+def delete_message_callback(context: CallbackContext):
+    try:
+        context.bot.delete_message(chat_id=context.job.context['chat_id'], message_id=context.job.context['message_id'])
+    except Exception as e:
+        logger.warning(f"Could not auto-delete message: {e}")
+
+def schedule_message_deletion(context: CallbackContext, message, user_id):
+    delay = ADMIN_DELETE_DELAY if is_admin(user_id) else USER_DELETE_DELAY
+    context.job_queue.run_once(
+        delete_message_callback,
+        delay,
+        context={'chat_id': message.chat_id, 'message_id': message.message_id}
+    )
+
+def reply_and_delete(update_or_query, context: CallbackContext, text: str, **kwargs):
+    chat = None; user_id = None
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        chat = update_or_query.message.chat; user_id = update_or_query.message.from_user.id
+        sent_message = chat.send_message(text, **kwargs)
+    elif hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat:
+        chat = update_or_query.effective_chat; user_id = update_or_query.effective_user.id
+        sent_message = chat.send_message(text, **kwargs)
+    else: return None
+
+    if not is_admin(user_id):
+        schedule_message_deletion(context, sent_message, user_id)
+    return sent_message
+
+def is_verified_db(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM verified_users WHERE user_id = ?", (user_id,)); return cur.fetchone() is not None
+def set_verified_db(user_id: int):
+    try: cur.execute("INSERT OR IGNORE INTO verified_users (user_id) VALUES (?)", (user_id,)); conn.commit()
+    except Exception as e: logger.error(f"SQLite insert error: {e}")
+
+def is_blocked_db(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+    return cur.fetchone() is not None
+
+def get_blocked_reason(user_id: int) -> str:
+    cur.execute("SELECT reason FROM blocked_users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    return row[0] if row else "N/A"
+
+def block_user_db(user_id: int, reason: str):
+    try:
+        cur.execute("INSERT OR REPLACE INTO blocked_users (user_id, reason, timestamp) VALUES (?, ?, ?)", 
+                    (user_id, reason, int(time.time())))
+        conn.commit()
+        logger.info(f"Blocked user {user_id} in DB for reason: {reason}")
+    except Exception as e:
+        logger.error(f"SQLite block user error: {e}")
+
+def unblock_user_db(user_id: int):
+    try:
+        cur.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        logger.info(f"Unblocked user {user_id} in DB")
+    except Exception as e:
+        logger.error(f"SQLite unblock user error: {e}")
+
+def get_fail_count(agent_code: str) -> int:
+    cur.execute("SELECT count FROM reset_fails WHERE agent_code = ?", (agent_code,))
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def increment_fail_count(agent_code: str):
+    count = get_fail_count(agent_code) + 1
+    cur.execute("INSERT OR REPLACE INTO reset_fails (agent_code, count) VALUES (?, ?)", (agent_code, count))
+    conn.commit()
+    return count
+
+def clear_fail_count(agent_code: str):
+    cur.execute("DELETE FROM reset_fails WHERE agent_code = ?", (agent_code,))
+    conn.commit()
+
+# --- Helper for Payment Methods ---
+def is_method_active(method_name: str) -> bool:
+    cur.execute("SELECT is_active FROM payment_methods WHERE method_name = ?", (method_name,))
+    row = cur.fetchone()
+    return row[0] == 1 if row else False
+
+def toggle_method_status(method_name: str):
+    current_status = is_method_active(method_name)
+    new_status = 0 if current_status else 1
+    cur.execute("UPDATE payment_methods SET is_active = ? WHERE method_name = ?", (new_status, method_name))
+    conn.commit()
+    return new_status
+
+def generate_unique_code(existing_codes, min_len=4, max_len=12):
+    for _ in range(2000):
+        length = random.randint(min_len, max_len)
+        code = "".join(random.choices("0123456789", k=length))
+        if code not in existing_codes: return code
+    return None
+
+def is_admin(user_id: int) -> bool: return user_id in ADMIN_IDS
+
+def show_blocked_message(update_or_query, context: CallbackContext):
+    user_id = update_or_query.effective_user.id
+    reason = get_blocked_reason(user_id)
+    
+    text = (
+        "🚨 **আপনি ব্লকড** 🚨\n\n"
+        "আপনি নিয়ম ভাঙ্গা কারণে আপনার একাউন্ট এবং আপনার এজেন্ট কোড ব্লক করে দেওয়া হয়েছে।\n\n"
+        f"**কারণ:** {reason}\n\n"
+        "যতক্ষণ না এডমিন আনব্লক করবে ততক্ষণ এই এজেন্ট কোড বা এই আইডি ব্যবহার করে কাজ করতে পারবেন না। "
+        "আপনি আনব্লক করতে চাইলে এডমিনের সঙ্গে যোগাযোগ করুন।"
+    )
+    keyboard = [[InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=f"tg://user?id={ADMIN_IDS[0]}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    chat = None
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        chat = update_or_query.message.chat
+    elif hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat:
+        chat = update_or_query.effective_chat
+    
+    if chat:
+        chat.send_message(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    
+    if hasattr(update_or_query, 'callback_query') and update_or_query.callback_query:
+        try:
+            update_or_query.callback_query.answer("❌ আপনি ব্লকড।", show_alert=True)
+        except Exception as e:
+            logger.warning(f"Could not answer callback query for blocked user: {e}")
+
+def force_reverify(update: Update, context: CallbackContext):
+    user_state_buttons = [
+        [InlineKeyboardButton("📢 Join Telegram Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
+        [InlineKeyboardButton("📺 Subscribe YouTube Channel", url=YOUTUBE_LINK)],
+        [InlineKeyboardButton("✅ Verify", callback_data="verify_user")],
+    ]
+    reply_markup = InlineKeyboardMarkup(user_state_buttons)
+    
+    chat = update.message.chat if hasattr(update, 'message') and update.message else update.effective_chat
+    if chat:
+        chat.send_message(
+            "⚠️ বটটি ব্যবহার করতে আপনাকে অবশ্যই চ্যানেলে জয়েন থাকতে হবে।\n\n"
+            "অনুগ্রহ করে চ্যানেলে জয়েন করে '✅ Verify' বাটনে চাপুন।",
+            reply_markup=reply_markup
+        )
+
+def is_channel_member(user_id: int, context: CallbackContext) -> bool:
+    if is_admin(user_id):
+        return True
+    try:
+        member = context.bot.get_chat_member(f"@{CHANNEL_USERNAME.lstrip('@')}", user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking membership for {user_id}: {e}")
+        return False
+
+def show_main_menu(update_or_query):
+    buttons = [
+        [KeyboardButton("🔑 কোড পান"), KeyboardButton("📋 Agent Code দিয়ে ডিটেল চেক")],
+        [KeyboardButton("💰 আমার একাউন্ট"), KeyboardButton("💸 টাকা তুলুন (Withdraw)")],
+        [KeyboardButton("(পাসওয়ার্ড & পেমেন্ট নম্বর পরিবর্তন)"), KeyboardButton("📊 পেমেন্ট স্ট্যাটাস")],
+        [KeyboardButton("🎁 অফার/নোটিশ"), KeyboardButton("🔗 ফর্ম পূরণ করুন")],
+        [KeyboardButton("🔑 পাসওয়ার্ড রিসেট"), KeyboardButton("ℹ️ হেল্প")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+    
+    chat = None
+    if hasattr(update_or_query, 'message') and update_or_query.message is not None:
+        chat = update_or_query.message.chat
+    elif hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat is not None:
+         chat = update_or_query.effective_chat
+         
+    if chat:
+        chat.send_message("🎯 মেইন মেনু:", reply_markup=reply_markup)
+
+
+def show_full_admin_menu(update_or_query):
+    admin_buttons = [
+        [KeyboardButton("➕ টাকা এড করুন"), KeyboardButton("➕ বাল্ক টাকা এড")],
+        [KeyboardButton("⚙️ অন্যান্য অপশন")] # This button reveals the rest
+    ]
+    user_buttons = [
+        [KeyboardButton("🔑 কোড পান"), KeyboardButton("📋 Agent Code দিয়ে ডিটেল চেক")],
+        [KeyboardButton("💰 আমার একাউন্ট"), KeyboardButton("💸 টাকা তুলুন (Withdraw)")],
+        [KeyboardButton("(পাসওয়ার্ড & পেমেন্ট নম্বর পরিবর্তন)"), KeyboardButton("📊 পেমেন্ট স্ট্যাটাস")],
+        [KeyboardButton("🎁 অফার/নোটিশ"), KeyboardButton("🔗 ফর্ম পূরণ করুন")],
+        [KeyboardButton("🔑 পাসওয়ার্ড রিসেট"), KeyboardButton("ℹ️ হেল্প")],
+    ]
+    full_menu = admin_buttons + user_buttons
+    reply_markup = ReplyKeyboardMarkup(full_menu, resize_keyboard=True, one_time_keyboard=False)
+    
+    chat = None
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        chat = update_or_query.message.chat
+    elif hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat:
+        chat = update_or_query.effective_chat
+    
+    if chat:
+        chat.send_message("R2k tricks zone", reply_markup=reply_markup)
+
+# --- NEW FUNCTION: Show All Other Admin Buttons ---
+def show_all_admin_buttons(update, context):
+    if not is_admin(update.effective_user.id): return
+
+    other_admin_buttons = [
+        [KeyboardButton("➖ টাকা কমান"), KeyboardButton("🔍 ইউজার ডিটেলস")],
+        [KeyboardButton("📊 ইউজার সংখ্যা"), KeyboardButton("📢 ব্রডকাস্ট")],
+        [KeyboardButton("✍️ নোটিশ সেট করুন"), KeyboardButton("🚫 ব্লক করুন")],
+        [KeyboardButton("✅ আনব্লক করুন"), KeyboardButton("⚙️ পেমেন্ট মেথড কন্ট্রোল")],
+        [KeyboardButton("🔧 পেমেন্ট ফিক্স"), KeyboardButton("💰 জমার হিস্ট্রি")],
+        [KeyboardButton("🔙 মেইন মেনু")] # Back button
+    ]
+    
+    reply_markup = ReplyKeyboardMarkup(other_admin_buttons, resize_keyboard=True)
+    update.message.reply_text("⚙️ **অন্যান্য অ্যাডমিন অপশন:**", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+# --- NEW FUNCTION: Back to Main Menu ---
+def back_to_main_admin_menu(update, context):
+    show_full_admin_menu(update)
+
+def start(update: Update, context: CallbackContext):
+    user = update.message.from_user
+    
+    if is_blocked_db(user.id):
+        show_blocked_message(update, context)
+        return
+    
+    if is_admin(user.id): show_full_admin_menu(update); return
+    if is_verified_db(user.id):
+        if is_channel_member(user.id, context):
+            show_main_menu(update)
+            return
+        else:
+            force_reverify(update, context)
+            return
+
+    user_state_buttons = [
+        [InlineKeyboardButton("📢 Join Telegram Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")],
+        [InlineKeyboardButton("📺 Subscribe YouTube Channel", url=YOUTUBE_LINK)],
+        [InlineKeyboardButton("✅ Verify", callback_data="verify_user")],
+    ]
+    reply_markup = InlineKeyboardMarkup(user_state_buttons)
+    update.message.reply_text(
+        "👋 হ্যালো!\n\nবট ব্যবহার করতে হলে আগে:\n\n"
+        "1️⃣ Telegram Channel-এ Join করুন\n"
+        "2️⃣ YouTube Channel-টি Subscribe করুন\n"
+        "3️⃣ তারপর ✅ Verify বাটনে চাপুন",
+        reply_markup=reply_markup,
+    )
+
+def help_button_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context)
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🤖 বট ব্যবহারের নিয়ম", callback_data="show_help_rules")],
+        [InlineKeyboardButton("💵 টাকা তোলার নিয়ম", url="https://t.me/social_workars4/658")],
+        [InlineKeyboardButton("📝 ফর্ম পূরণের নিয়ম", url="https://youtu.be/Zpw6rZ3SK90?si=TqwvzFG5TTQJ8udL")],
+        [InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=f"tg://user?id={ADMIN_IDS[0]}")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("সাহায্যের জন্য নিচের অপশন বেছে নিন:", reply_markup=reply_markup)
+
+def show_help_rules(update: Update, context: CallbackContext):
+    query = update.callback_query;
+    user_id = query.from_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+    
+    query.answer()
+    help_text = (
+        "✨ **বট ব্যবহারে সহায়তা** ✨\n\n"
+        "🔑 **এজেন্ট কোড খুঁজুন**: আপনার রেজিস্টার্ড ইমেইলটি দিন।\n\n"
+        "📋 **প্রোফাইল দেখুন**: আপনার এজেন্ট কোড ও পাসওয়ার্ড দিয়ে অ্যাকাউন্টের সকল তথ্য দেখুন।\n\n"
+        "💰 **ব্যালেন্স চেক**: আপনার এজেন্ট কোড ও পাসওয়ার্ড দিয়ে অ্যাকাউন্টে বর্তমান ব্যালেন্স জানুন।\n\n"
+        "💸 **টাকা উত্তোলন**: সর্বনিম্ন ৳৫০ থাকলে টাকা তোলার অনুরোধ করতে পারবেন।\n\n"
+        "🔄 **পেমেন্ট তথ্য আপডেট**: আপনার বিকাশ, নগদ, Binance আইডি বা পাসওয়ার্ড পরিবর্তন করুন।\n\n"
+        "📝 **নতুন রেজিস্ট্রেশন**: আমাদের সাথে কাজ করতে চাইলে, গুগল ফর্মটি পূরণ করুন।"
+    )
+    query.edit_message_text(text=help_text, parse_mode=ParseMode.MARKDOWN)
+
+def handle_regular_message(update: Update, context: CallbackContext):
+    if not update.message or not update.message.text: return
+    text = update.message.text.strip(); user_id = update.message.from_user.id
+
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+
+    if not is_verified_db(user_id) and not is_admin(user_id):
+        force_reverify(update, context); return
+
+    if not is_channel_member(user_id, context):
+        force_reverify(update, context)
+        return
+        
+    if text == "🔗 ফর্ম পূরণ করুন":
+        update.message.reply_text(f"📝 Form পূরণ করুন:\n{FORM_LINK}"); return
+
+def cancel_and_show_menu(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    
+    if is_blocked_db(user_id):
+        return ConversationHandler.END
+
+    reply_and_delete(update, context, "✅ প্রক্রিয়াটি বাতিল করা হয়েছে। মূল মেনুতে ফিরে যাওয়া হলো।")
+    context.user_data.clear()
+    if is_admin(user_id): show_full_admin_menu(update)
+    else: show_main_menu(update)
+    return ConversationHandler.END
+    
+def verify_user(update: Update, context: CallbackContext):
+    query = update.callback_query; user_id = query.from_user.id
+    
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+    
+    try:
+        member = context.bot.get_chat_member(f"@{CHANNEL_USERNAME.lstrip('@')}", user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            set_verified_db(user_id); query.answer("✅ ভেরিফিকেশন সফল হয়েছে!", show_alert=True)
+            query.edit_message_text("✅ Verification Complete!"); show_main_menu(query)
+        else: query.answer("⚠️ আপনি এখনও চ্যানেলে জয়েন করেননি।", show_alert=True)
+    except Exception as e: logger.error(f"get_chat_member error: {e}"); query.answer("⚠️ ভেরিফিকেশন চেক করতে সমস্যা হচ্ছে।", show_alert=True)
+
+def find_cell_robust(query, in_column, sheet_obj=user_sheet):
+    try:
+        values = sheet_obj.col_values(in_column, value_render_option='FORMATTED_VALUE')
+        cleaned_values = [val.strip("'") for val in values]
+        if query in cleaned_values:
+            row = cleaned_values.index(query) + 1
+            return gspread.Cell(row, in_column, value=query)
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error in find_cell_robust: {e}")
+        return None
+
+def get_password_and_proceed(update: Update, context: CallbackContext, next_state):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    user_id = update.message.from_user.id
+    
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell is None:
+        reply_and_delete(update, context, "❌ আপনার Agent Code টি পাওয়া যায়নি।")
+        return cancel_and_show_menu(update, context)
+        
+    try:
+        status = user_sheet.cell(cell.row, STATUS_COL).value
+        if status == "Blocked":
+            reason = f"Attempted access to blocked code {agent_code}"
+            block_user_db(user_id, reason=reason)
+            logger.warning(f"Blocking user {user_id} for accessing blocked code {agent_code}")
+            
+            show_blocked_message(update, context)
+            return cancel_and_show_menu(update, context)
+    except Exception as e:
+        pass
+
+    password = user_sheet.cell(cell.row, PASSWORD_COL).value
+    if not password or not password.strip():
+        reply_and_delete(update, context, "⚠️ আপনার কোনো পাসওয়ার্ড সেট করা নেই। '🔑 কোড পান' বাটন ব্যবহার করে পাসওয়ার্ড সেট করুন।")
+        return cancel_and_show_menu(update, context)
+    
+    # Save AGENT CODE to user_data for later use
+    context.user_data.update({'agent_code': agent_code, 'row': cell.row, 'saved_password': password.strip("'")})
+    reply_and_delete(update, context, "🔐 আপনার পাসওয়ার্ড দিন:", reply_markup=BACK_KEYBOARD)
+    return next_state
+def has_pending_request(user_id: int) -> bool:
+    cur.execute("SELECT 1 FROM payment_history WHERE user_id = ? AND status = '⏳ পেন্ডিং'", (user_id,))
+    return cur.fetchone() is not None
+
+def is_code_pending(agent_code: str) -> bool:
+    """Checks if a specific agent code has a pending request from ANY user."""
+    cur.execute("SELECT 1 FROM payment_history WHERE agent_code = ? AND status = '⏳ পেন্ডিং'", (agent_code,))
+    return cur.fetchone() is not None
+
+def get_last_approved_time(agent_code: str) -> int:
+    """Returns the timestamp of the last approved payment for the AGENT CODE."""
+    try:
+        cur.execute("SELECT MAX(timestamp) FROM payment_history WHERE agent_code = ? AND status = '✅ অ্যাপ্রুভড'", (agent_code,))
+        result = cur.fetchone()
+        return result[0] if result and result[0] else 0
+    except Exception as e:
+        logger.error(f"Error fetching last approved time: {e}")
+        return 0
+
+# --- CONVERSATION HANDLERS ---
+def get_code_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    if not is_channel_member(user_id, context):
+        force_reverify(update, context); return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "🔑 আপনার রেজিস্টার্ড Gmail টি দিন:", reply_markup=BACK_KEYBOARD); return GET_CODE_GMAIL
+
+def handle_get_code_gmail(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    gmail = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+    
+    if "@" not in gmail:
+        reply_and_delete(update, context, "⚠️ অনুগ্রহ করে একটি সঠিক ইমেইল দিন। আবার চেষ্টা করুন।"); return GET_CODE_GMAIL
+    
+    cell = find_cell_robust(gmail, in_column=GMAIL_COL)
+    if cell is None:
+        update.message.reply_text(f"❌ আপনার ইমেইলটি খুঁজে পাওয়া যায়নি। অনুগ্রহ করে প্রথমে ফর্মটি পূরণ করুন:\n{FORM_LINK}"); return cancel_and_show_menu(update, context)
+        
+    try:
+        status = user_sheet.cell(cell.row, STATUS_COL).value
+        if status == "Blocked":
+            reason = f"Attempted access to blocked code via email {gmail}"
+            block_user_db(user_id, reason=reason)
+            logger.warning(f"Blocking user {user_id} for accessing blocked code via email {gmail}")
+            
+            show_blocked_message(update, context)
+            return cancel_and_show_menu(update, context)
+    except Exception as e:
+        pass
+
+    user_id_on_sheet = user_sheet.cell(cell.row, USER_ID_COL).value
+    current_user_id = update.effective_user.id
+    if not user_id_on_sheet:
+        user_sheet.update_cell(cell.row, USER_ID_COL, current_user_id)
+        logger.info(f"Saved user_id {current_user_id} for gmail {gmail}")
+        
+    agent_code = user_sheet.cell(cell.row, AGENT_CODE_COL).value
+    password = user_sheet.cell(cell.row, PASSWORD_COL).value
+    if agent_code and agent_code.strip():
+        update.message.reply_text(f"✅ আপনার Agent Code: `{agent_code.strip()}`", parse_mode=ParseMode.MARKDOWN)
+        if not password or not password.strip():
+            reply_and_delete(update, context, "⚠️ আপনার কোনো পাসওয়ার্ড সেট করা নেই।\n\nঅনুগ্রহ করে এখনই একটি ৫ থেকে ৮ অক্ষরের পাসওয়ার্ড দিন। (নমুনা: Karim@24)", reply_markup=BACK_KEYBOARD)
+            context.user_data['password_row'] = cell.row; return SET_NEW_PASSWORD
+        else: return cancel_and_show_menu(update, context)
+    else:
+        all_codes = set(filter(None, [c.strip() for c in user_sheet.col_values(AGENT_CODE_COL)]))
+        new_code = generate_unique_code(all_codes, 4, 12)
+        if new_code:
+            user_sheet.update_cell(cell.row, AGENT_CODE_COL, f"'{new_code}")
+            update.message.reply_text(f"✅ আপনার জন্য একটি নতুন Agent Code তৈরি করা হয়েছে: `{new_code}`", parse_mode=ParseMode.MARKDOWN)
+            reply_and_delete(update, context, "এখন আপনার অ্যাকাউন্টের নিরাপত্তার জন্য একটি ৫ থেকে ৮ অক্ষরের পাসওয়ার্ড দিন। (নমুনা: Karim@24)", reply_markup=BACK_KEYBOARD)
+            context.user_data['password_row'] = cell.row; return SET_NEW_PASSWORD
+        else:
+            reply_and_delete(update, context, "⚠️ কোড জেনারেট করতে সমস্যা হয়েছে।"); return cancel_and_show_menu(update, context)
+
+def handle_set_new_password(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    password = update.message.text.strip()
+    if not (5 <= len(password) <= 8):
+        reply_and_delete(update, context, "❌ পাসওয়ার্ডটি অবশ্যই ৫ থেকে ৮ অক্ষরের মধ্যে হতে হবে। আবার চেষ্টা করুন:")
+        return SET_NEW_PASSWORD
+    row = context.user_data['password_row']
+    try:
+        user_sheet.update_cell(row, PASSWORD_COL, f"'{password}")
+        reply_and_delete(update, context, "✅ আপনার পাসওয়ার্ড সফলভাবে সেট করা হয়েছে।")
+    except Exception as e:
+        logger.error(f"Set new password error: {e}")
+        reply_and_delete(update, context, "⚠️ পাসওয়ার্ড সেট করতে সমস্যা হয়েছে।")
+    return cancel_and_show_menu(update, context)
+
+def balance_check_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "💰 আপনার Agent Code টি দিন:", reply_markup=BACK_KEYBOARD); return BALANCE_CHECK_CODE
+
+def handle_balance_check_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_BALANCE)
+
+def verify_password_for_balance(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    password = update.message.text.strip()
+    if password == context.user_data['saved_password']:
+        row = context.user_data['row']
+        user_sheet.update_cell(row, USER_ID_COL, update.effective_user.id) # Update User ID on login
+        balance = user_sheet.cell(row, BALANCE_COL).value or "0"
+        reply_and_delete(update, context, f"💰 আপনার বর্তমান ব্যালেন্স: `৳{balance}`", parse_mode=ParseMode.MARKDOWN)
+    else:
+        reply_and_delete(update, context, "❌ ভুল পাসওয়ার্ড।")
+    return cancel_and_show_menu(update, context)
+
+def get_details_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "📋 আপনার Agent Code টি দিন:", reply_markup=BACK_KEYBOARD); return GET_DETAILS_CODE
+
+def handle_get_details_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_DETAILS)
+
+def verify_password_for_details(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    password = update.message.text.strip()
+    if password == context.user_data['saved_password']:
+        row = context.user_data['row']
+        user_sheet.update_cell(row, USER_ID_COL, update.effective_user.id) # Update User ID on login
+        row_data = user_sheet.row_values(row)
+        def safe_get(index, r_data): return r_data[index].strip("'") if index < len(r_data) and str(r_data[index]).strip() else "নাই"
+        reply_text = (
+            "📋 **সম্পূর্ণ প্রোফাইল** 📋\n\n"
+            f"*Timestamp:* `{safe_get(TIMESTAMP_COL - 1, row_data)}`\n" f"📧 *Gmail:* `{safe_get(GMAIL_COL - 1, row_data)}`\n"
+            f"👤 *Name:* `{safe_get(NAME_COL - 1, row_data)}`\n\n" f"📱 *WhatsApp:* `{safe_get(WHATSAPP_COL - 1, row_data)}`\n"
+            f"💬 *Telegram:* `{safe_get(TELEGRAM_COL - 1, row_data)}`\n\n" f"💳 *Bkash:* `{safe_get(BKASH_COL - 1, row_data)}`\n"
+            f"💳 *Nagad:* `{safe_get(NAGAD_COL - 1, row_data)}`\n" f"🏦 *Binance ID:* `{safe_get(BINANCE_COL - 1, row_data)}`\n\n"
+            f"🔑 **Agent Code:** `{safe_get(AGENT_CODE_COL - 1, row_data)}`\n" f"💰 **Balance:** `৳{safe_get(BALANCE_COL - 1, row_data) or 0}`"
+        )
+        reply_and_delete(update, context, reply_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        reply_and_delete(update, context, "❌ ভুল পাসওয়ার্ড।")
+    return cancel_and_show_menu(update, context)
+
+def add_money_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "টাকা যোগ করার জন্য ব্যবহারকারীর Agent Code দিন:", reply_markup=BACK_KEYBOARD); return ADD_MONEY_CODE
+
+def add_money_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell:
+        context.user_data.update({'add_money_code': agent_code, 'add_money_row': cell.row})
+        reply_and_delete(update, context, "কত টাকা যোগ করতে চান? (যেমন: 50 বা +50):"); return ADD_MONEY_AMOUNT
+    else:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি। আবার চেষ্টা করুন."); return ADD_MONEY_CODE
+
+def add_money_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    amount_text = update.message.text.strip().lstrip('+')
+    
+    try:
+        amount_to_add = float(amount_text)
+        if amount_to_add <= 0:
+            raise ValueError
+        context.user_data['amount_to_add'] = amount_to_add
+        reply_and_delete(update, context, "কিসের টাকা লিখুন:")
+        return GET_ADD_SOURCE
+
+    except ValueError:
+        reply_and_delete(update, context, "❌ সঠিক পরিমাণ দিন (সংখ্যা বা দশমিক)।")
+        return ADD_MONEY_AMOUNT
+
+def get_add_source(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['add_source'] = update.message.text
+    reply_and_delete(update, context, "কত তারিখের টাকা:")
+    return GET_ADD_DATE
+
+def get_add_date(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['add_date'] = update.message.text
+    reply_and_delete(update, context, "১ পিস কত টাকা করে:")
+    return GET_ADD_RATE
+
+def get_add_rate(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    rate = update.message.text
+    context.user_data['add_rate'] = rate
+    
+    # Retrieve all data
+    row_index = context.user_data['add_money_row']
+    agent_code = context.user_data['add_money_code']
+    amount_to_add = context.user_data['amount_to_add']
+    source = context.user_data['add_source']
+    date = context.user_data['add_date']
+
+    try:
+        # Update Sheet
+        current_balance = float((user_sheet.cell(row_index, BALANCE_COL).value or "0").replace(',', ''))
+        new_balance = current_balance + amount_to_add
+        user_sheet.update_cell(row_index, BALANCE_COL, new_balance)
+        
+        # --- Save to DB ---
+        cur.execute("INSERT INTO add_money_history (agent_code, amount, source, date_text, rate_text, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                    (agent_code, amount_to_add, source, date, rate, int(time.time())))
+        conn.commit()
+
+        # Notify Admin
+        reply_and_delete(update, context, f"✅ সফল! Agent Code: {agent_code}-এ ৳{amount_to_add} যোগ করা হয়েছে।\nনতুন ব্যালেন্স: ৳{new_balance}")
+
+        # Notify User
+        target_user_id_str = user_sheet.cell(row_index, USER_ID_COL).value
+        if target_user_id_str and target_user_id_str.isdigit():
+            if is_blocked_db(int(target_user_id_str)):
+                logger.info(f"Skipped 'add money' notification for blocked user {target_user_id_str}")
+                return
+            
+            notification_text = (
+                f"🎉 **টাকা যোগ হয়েছে** 🎉\n\n"
+                f"💰 **পরিমাণ:** ৳{amount_to_add}\n"
+                f"📝 **কিসের টাকা:** {source}\n"
+                f"📅 **তারিখ:** {date}\n"
+                f"💵 **রেট:** {rate}\n\n"
+                f"🏦 **বর্তমান ব্যালেন্স:** ৳{new_balance}"
+            )
+            
+            user_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("বট থেকে টাকা তুলার নিয়ম", url="https://t.me/social_workars4/658")]
+            ])
+            
+            sent_msg = context.bot.send_message(chat_id=int(target_user_id_str), text=notification_text, reply_markup=user_markup, parse_mode=ParseMode.MARKDOWN)
+            
+            context.job_queue.run_once(
+                delete_message_callback,
+                86400, 
+                context={'chat_id': sent_msg.chat_id, 'message_id': sent_msg.message_id}
+            )
+
+    except Exception as e:
+        logger.error(f"Admin add money update sheet error: {e}")
+        reply_and_delete(update, context, "⚠️ শিটে ব্যালেন্স আপডেট করতে সমস্যা হয়েছে।")
+    
+    context.user_data.clear()
+    if is_admin(update.effective_user.id):
+        show_full_admin_menu(update)
+    return ConversationHandler.END
+
+# --- UPDATED FUNCTIONS FOR BULK ADD MONEY ---
+def bulk_add_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    # Check if defaults are already saved in user_data
+    saved_metadata = context.user_data.get('bulk_metadata')
+    
+    if saved_metadata:
+        date, source, rate = saved_metadata
+        msg = (
+            f"💾 **সেভ করা তথ্য:**\n"
+            f"📅 তারিখ: `{date}`\n"
+            f"📝 অ্যাকাউন্ট: `{source}`\n"
+            f"💵 রেট: `{rate}`\n\n"
+            "এখন শুধু নিচের ফরম্যাটে লিস্ট দিন:\n"
+            "`Amount AgentCode`\n\n"
+            "উদাহরণ:\n`11 ✅ 649975`\n`27.5 33086362`"
+        )
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("♻️ সেভ মেসেজ কিলিয়ার")], [KeyboardButton(BACK_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=True)
+        reply_and_delete(update, context, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return BULK_PROCESS_LIST
+    else:
+        instruction = (
+            "➕ **বাল্ক টাকা এড (সেটআপ)** ➕\n\n"
+            "প্রথমে ডিফল্ট তথ্যগুলো সেট করুন (যা সবার জন্য একই হবে)।\n\n"
+            "নিচের ফরম্যাটে লিখুন:\n"
+            "`তারিখ / কি একাউন্ট / রেট`\n\n"
+            "উদাহরণ:\n"
+            "`22-12-25 / Gmail 2FA / 10`"
+        )
+        reply_and_delete(update, context, instruction, parse_mode=ParseMode.MARKDOWN, reply_markup=BACK_KEYBOARD)
+        return BULK_SETUP_DEFAULTS
+
+def handle_bulk_defaults(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    text = update.message.text.strip()
+    
+    parts = text.split('/')
+    if len(parts) != 3:
+        reply_and_delete(update, context, "❌ ভুল ফরম্যাট! দয়া করে `তারিখ / একাউন্ট / রেট` এভাবে লিখুন।")
+        return BULK_SETUP_DEFAULTS
+    
+    date = parts[0].strip()
+    source = parts[1].strip()
+    rate = parts[2].strip()
+    
+    context.user_data['bulk_metadata'] = (date, source, rate)
+    
+    msg = (
+        f"✅ তথ্য সেভ করা হয়েছে!\n\n"
+        f"📅 তারিখ: `{date}`\n"
+        f"📝 অ্যাকাউন্ট: `{source}`\n"
+        f"💵 রেট: `{rate}`\n\n"
+        "এখন নিচের ফরম্যাটে লিস্ট দিন:\n"
+        "`Amount AgentCode`\n"
+        "(মাঝখানে স্পেস বা ইমোজি থাকলে সমস্যা নেই)\n\n"
+        "উদাহরণ:\n`11 ✅ 649975`\n`27.5 33086362`"
+    )
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("♻️ সেভ মেসেজ কিলিয়ার")], [KeyboardButton(BACK_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=True)
+    reply_and_delete(update, context, msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    return BULK_PROCESS_LIST
+
+def handle_bulk_process(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    text = update.message.text.strip()
+    
+    if text == "♻️ সেভ মেসেজ কিলিয়ার":
+        context.user_data.pop('bulk_metadata', None)
+        reply_and_delete(update, context, "🗑️ সেভ করা তথ্য মুছে ফেলা হয়েছে। আবার নতুন করে তথ্য দিন।")
+        return bulk_add_start(update, context)
+
+    saved_metadata = context.user_data.get('bulk_metadata')
+    if not saved_metadata:
+        reply_and_delete(update, context, "⚠️ সেভ করা তথ্য পাওয়া যায়নি। দয়া করে আবার শুরু করুন।")
+        return bulk_add_start(update, context)
+        
+    date, source, rate = saved_metadata
+    lines = text.split('\n')
+    
+    success_count = 0
+    fail_count = 0
+    report = "📋 **বাল্ক প্রসেসিং রিপোর্ট:**\n\n"
+    reply_and_delete(update, context, "⏳ প্রসেসিং হচ্ছে... অনুগ্রহ করে অপেক্ষা করুন...")
+
+    for line in lines:
+        if not line.strip(): continue
+        
+        try:
+            parts = line.split()
+            if len(parts) < 2:
+                report += f"❌ Format Error: `{line}`\n"
+                fail_count += 1
+                continue
+            
+            amount_str = parts[0].strip()   
+            agent_code = parts[-1].strip()  
+            
+            try:
+                amount_to_add = float(amount_str)
+            except ValueError:
+                report += f"❌ Amount Error ({agent_code}): `{amount_str}`\n"
+                fail_count += 1
+                continue
+
+            cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+            if not cell:
+                report += f"❌ Code Not Found: `{agent_code}`\n"
+                fail_count += 1
+                continue
+            
+            row_index = cell.row
+            current_balance = float((user_sheet.cell(row_index, BALANCE_COL).value or "0").replace(',', ''))
+            new_balance = current_balance + amount_to_add
+            user_sheet.update_cell(row_index, BALANCE_COL, new_balance)
+            
+            cur.execute("INSERT INTO add_money_history (agent_code, amount, source, date_text, rate_text, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                        (agent_code, amount_to_add, source, date, rate, int(time.time())))
+            conn.commit()
+            
+            success_count += 1
+            report += f"✅ Added ৳{amount_to_add} to `{agent_code}`\n"
+            
+            target_user_id_str = user_sheet.cell(row_index, USER_ID_COL).value
+            if target_user_id_str and target_user_id_str.isdigit():
+                if not is_blocked_db(int(target_user_id_str)):
+                    notification_text = (
+                        f"🎉 **টাকা যোগ হয়েছে** 🎉\n\n"
+                        f"💰 **পরিমাণ:** ৳{amount_to_add}\n"
+                        f"📝 **কিসের টাকা:** {source}\n"
+                        f"📅 **তারিখ:** {date}\n"
+                        f"💵 **রেট:** {rate}\n\n"
+                        f"🏦 **বর্তমান ব্যালেন্স:** ৳{new_balance}"
+                    )
+                    user_markup = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("বট থেকে টাকা তুলার নিয়ম", url="https://t.me/social_workars4/658")]
+                    ])
+                    try:
+                        sent_msg = context.bot.send_message(chat_id=int(target_user_id_str), text=notification_text, reply_markup=user_markup, parse_mode=ParseMode.MARKDOWN)
+                        context.job_queue.run_once(
+                            delete_message_callback,
+                            86400, 
+                            context={'chat_id': sent_msg.chat_id, 'message_id': sent_msg.message_id}
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify user {target_user_id_str}: {e}")
+
+        except Exception as e:
+            logger.error(f"Bulk add error for line {line}: {e}")
+            report += f"❌ System Error: `{line}`\n"
+            fail_count += 1
+            
+    final_summary = f"\n✅ সফল: {success_count}\n❌ ব্যর্থ: {fail_count}\n\n`{date} = {source}`"
+    
+    if len(report) > 4000:
+        chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
+        for chunk in chunks:
+            update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text(final_summary, parse_mode=ParseMode.MARKDOWN)
+    else:
+        update.message.reply_text(report + final_summary, parse_mode=ParseMode.MARKDOWN)
+    
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("♻️ সেভ মেসেজ কিলিয়ার")], [KeyboardButton(BACK_BUTTON_TEXT)]], resize_keyboard=True, one_time_keyboard=True)
+    update.message.reply_text("আরও এড করতে চাইলে লিস্ট দিন, অথবা '♻️ সেভ মেসেজ কিলিয়ার' চাপুন।", reply_markup=keyboard)
+    return BULK_PROCESS_LIST
+def subtract_money_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "টাকা কমানোর জন্য ব্যবহারকারীর Agent Code দিন:", reply_markup=BACK_KEYBOARD); return SUBTRACT_MONEY_CODE
+
+def subtract_money_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if cell:
+        current_balance = float((user_sheet.cell(cell.row, BALANCE_COL).value or "0").replace(',', ''))
+        context.user_data.update({'subtract_money_code': agent_code, 'subtract_money_row': cell.row, 'subtract_money_balance': current_balance})
+        reply_and_delete(update, context, f"এই ব্যবহারকারীর বর্তমান ব্যালেন্স: ৳{current_balance}\nআপনি কত টাকা কমাতে চান?"); return SUBTRACT_MONEY_AMOUNT
+    else:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি। আবার চেষ্টা করুন."); return SUBTRACT_MONEY_CODE
+
+def subtract_money_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    amount_text = update.message.text.strip()
+    current_balance = context.user_data['subtract_money_balance']
+    
+    try:
+        amount_to_subtract = float(amount_text)
+        if amount_to_subtract <= 0:
+            raise ValueError
+    except ValueError:
+        reply_and_delete(update, context, "❌ সঠিক পরিমাণ দিন (সংখ্যা বা দশমিক)।")
+        return SUBTRACT_MONEY_AMOUNT
+
+    if amount_to_subtract > current_balance:
+        reply_and_delete(update, context, f"❌ ব্যবহারকারীর ব্যালেন্সের চেয়ে বেশি টাকা কমানো যাবে না।"); return SUBTRACT_MONEY_AMOUNT
+    row_index = context.user_data['subtract_money_row']
+    agent_code = context.user_data['subtract_money_code']
+    try:
+        new_balance = current_balance - amount_to_subtract; user_sheet.update_cell(row_index, BALANCE_COL, new_balance)
+        reply_and_delete(update, context, f"✅ সফল! Agent Code: {agent_code}-থেকে ৳{amount_to_subtract} কমানো হয়েছে।\n"f"নতুন ব্যালেন্স: ৳{new_balance}")
+        try:
+            target_user_id_str = user_sheet.cell(row_index, USER_ID_COL).value
+            if target_user_id_str and target_user_id_str.isdigit():
+                if is_blocked_db(int(target_user_id_str)):
+                    logger.info(f"Skipped 'subtract money' notification for blocked user {target_user_id_str}")
+                    return
+                notification_text = f"🚨 অ্যাডমিন আপনার অ্যাকাউন্ট থেকে ৳{amount_to_subtract} কমিয়েছে।\nআপনার নতুন ব্যালেন্স: ৳{new_balance}"
+                sent_msg = context.bot.send_message(chat_id=int(target_user_id_str), text=notification_text)
+                schedule_message_deletion(context, sent_msg, int(target_user_id_str))
+        except Exception as e:
+            logger.error(f"Could not send 'subtract money' notification to user for row {row_index}: {e}")
+    except Exception as e:
+        logger.error(f"Admin subtract money update sheet error: {e}")
+        reply_and_delete(update, context, "⚠️ শিটে ব্যালেন্স আপডেট করতে সমস্যা হয়েছে।")
+    context.user_data.clear(); show_full_admin_menu(update); return ConversationHandler.END
+
+def update_info_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "🔄 আপনার Agent Code টি দিন:", reply_markup=BACK_KEYBOARD); return UPDATE_INFO_CODE
+    
+def handle_update_info_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_UPDATE)
+
+def verify_password_for_update(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    password = update.message.text.strip()
+    if password != context.user_data['saved_password']:
+        reply_and_delete(update, context, "❌ ভুল পাসওয়ার্ড।"); return cancel_and_show_menu(update, context)
+    
+    row = context.user_data['row']
+    user_sheet.update_cell(row, USER_ID_COL, update.effective_user.id)
+    
+    context.user_data['update_info_row'] = row
+    keyboard = [[InlineKeyboardButton("🔐 পাসওয়ার্ড", callback_data=f"update_{PASSWORD_COL}_পাসওয়ার্ড")], [InlineKeyboardButton("💳 বিকাশ নম্বর", callback_data=f"update_{BKASH_COL}_বিকাশ")], [InlineKeyboardButton("💳 নগদ নম্বর", callback_data=f"update_{NAGAD_COL}_নগদ")], [InlineKeyboardButton("🏦 Binance ID", callback_data=f"update_{BINANCE_COL}_Binance")]]
+    reply_and_delete(update, context, "আপনি কোন তথ্যটি পরিবর্তন করতে চান?", reply_markup=InlineKeyboardMarkup(keyboard)); return CHOOSE_INFO_FIELD
+
+def update_info_choose_field(update: Update, context: CallbackContext):
+    query = update.callback_query;
+    
+    user_id = query.from_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    query.answer()
+    _, col_index, field_name = query.data.split('_')
+    context.user_data.update({'update_info_col': int(col_index), 'update_info_field_name': field_name})
+    
+    schedule_message_deletion(context, query.message, query.from_user.id)
+
+    if int(col_index) == PASSWORD_COL:
+        reply_and_delete(query, context, f"আপনার নতুন ৫ থেকে ৮ অক্ষরের **{field_name}** দিন। (নমুনা: Karim@24)", parse_mode=ParseMode.MARKDOWN)
+    else:
+        reply_and_delete(query, context, f"আপনার নতুন **{field_name}** নম্বর/আইডি দিন:", parse_mode=ParseMode.MARKDOWN)
+    return GET_NEW_INFO
+
+def update_info_get_new_value(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    new_value = update.message.text.strip(); row = context.user_data['update_info_row']
+    col = context.user_data['update_info_col']; field_name = context.user_data['update_info_field_name']
+    
+    if col == PASSWORD_COL and not (5 <= len(new_value) <= 8):
+        reply_and_delete(update, context, "❌ পাসওয়ার্ডটি অবশ্যই ৫ থেকে ৮ অক্ষরের মধ্যে হতে হবে। আবার চেষ্টা করুন:")
+        return GET_NEW_INFO
+        
+    try:
+        value_to_save = f"'{new_value}" if col not in [BALANCE_COL, USER_ID_COL] else new_value
+        
+        user_sheet.update_cell(row, col, value_to_save)
+        reply_and_delete(update, context, f"✅ আপনার **{field_name}** সফলভাবে আপডেট করা হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Update info sheet error: {e}")
+        reply_and_delete(update, context, "❌ তথ্য আপডেট করতে সমস্যা হয়েছে।")
+    context.user_data.clear()
+    if is_admin(update.effective_user.id): show_full_admin_menu(update)
+    else: show_main_menu(update)
+    return ConversationHandler.END
+    
+def withdraw_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return ConversationHandler.END
+    
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    if has_pending_request(user_id):
+        reply_and_delete(update, context, "❌ আপনার একটি পেমেন্ট রিকোয়েস্ট ইতোমধ্যে পেন্ডিং আছে। অনুগ্রহ করে সেটির স্ট্যাটাস আপডেট হওয়ার জন্য অপেক্ষা করুন।")
+        return ConversationHandler.END
+    
+    reply_and_delete(update, context, "💸 টাকা তোলার জন্য আপনার Agent Code টি দিন:", reply_markup=BACK_KEYBOARD)
+    return WITHDRAW_CODE
+
+def handle_withdraw_code(update: Update, context: CallbackContext):
+    return get_password_and_proceed(update, context, next_state=VERIFY_PASS_FOR_WITHDRAW)
+
+def verify_password_for_withdraw(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    # Get agent code from context (Saved in get_password_and_proceed)
+    agent_code = context.user_data.get('agent_code')
+
+    # --- PENDING & 24 HOUR CHECK START (AGENT CODE BASED) ---
+    if agent_code:
+        # Check 1: Is there ANY pending request for this agent code (from any user)?
+        if is_code_pending(agent_code):
+            reply_and_delete(update, context, f"❌ Agent Code `{agent_code}` এর একটি পেমেন্ট রিকোয়েস্ট ইতোমধ্যে পেন্ডিং আছে। অনুগ্রহ করে সেটির স্ট্যাটাস আপডেট হওয়ার জন্য অপেক্ষা করুন।", parse_mode=ParseMode.MARKDOWN)
+            return cancel_and_show_menu(update, context)
+
+        # Check 2: 24 Hour Limit Check
+        last_approved_time = get_last_approved_time(agent_code)
+        current_time = int(time.time())
+        
+        # 24 hours = 86400 seconds
+        if current_time - last_approved_time < 86400:
+            remaining_time = 86400 - (current_time - last_approved_time)
+            hours = remaining_time // 3600
+            minutes = (remaining_time % 3600) // 60
+            
+            warning_msg = (
+                "⚠️ **লিমিট অতিক্রম!** ⚠️\n\n"
+                f"এই Agent Code (`{agent_code}`) দিয়ে ২৪ ঘন্টার মধ্যে একবার পেমেন্ট নেওয়া হয়েছে।\n"
+                "অন্য কোনো আইডি দিয়েও এই কোড ব্যবহার করে এখন রিকোয়েস্ট করা যাবে না।\n\n"
+                f"⏳ **আবার রিকোয়েস্ট করতে পারবেন:** {hours} ঘন্টা {minutes} মিনিট পর।"
+            )
+            reply_and_delete(update, context, warning_msg, parse_mode=ParseMode.MARKDOWN)
+            return cancel_and_show_menu(update, context)
+    # --- PENDING & 24 HOUR CHECK END ---
+
+    password = update.message.text.strip()
+    if password != context.user_data['saved_password']:
+        reply_and_delete(update, context, "❌ ভুল পাসওয়ার্ড।"); return cancel_and_show_menu(update, context)
+    
+    row = context.user_data['row']
+    user_sheet.update_cell(row, USER_ID_COL, update.effective_user.id)
+    
+    user_details = user_sheet.row_values(row)
+    balance = float((user_details[BALANCE_COL - 1] if len(user_details) >= BALANCE_COL else "0").replace(',', ''))
+    if balance < 50:
+        reply_and_delete(update, context, f"❌ আপনার একাউন্টে পর্যাপ্ত ব্যালেন্স নেই। ন্যূনতম ৳৫০ প্রয়োজন।")
+        return cancel_and_show_menu(update, context)
+    
+    context.user_data.update({
+        'withdraw_code': agent_code, 
+        'withdraw_balance': balance, 
+        'user_details': user_details
+    })
+    
+    keyboard = [
+        [InlineKeyboardButton("💳 বিকাশ", callback_data="withdraw_bkash")],
+        [InlineKeyboardButton("💳 নগদ", callback_data="withdraw_nagad")],
+        [InlineKeyboardButton("🚀 রকেট", callback_data="withdraw_rocket")],
+        [InlineKeyboardButton("🏦 Binance", callback_data="withdraw_binance")]
+    ]
+    
+    reply_and_delete(update, context, f"আপনার ব্যালেন্স: ৳{balance}\n\nআপনি কোন মাধ্যমে টাকা নিতে চান?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_METHOD
+
+def withdraw_choose_method(update: Update, context: CallbackContext):
+    query = update.callback_query;
+    
+    user_id = query.from_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    query.answer(); _, method = query.data.split('_')
+    method_name = method.capitalize()
+
+    # --- Check if method is active ---
+    if not is_method_active(method_name):
+        active_methods = []
+        if is_method_active('Bkash'): active_methods.append('বিকাশ')
+        if is_method_active('Nagad'): active_methods.append('নগদ')
+        if is_method_active('Rocket'): active_methods.append('রকেট')
+        if is_method_active('Binance'): active_methods.append('Binance')
+        
+        alternatives = ", ".join(active_methods)
+        msg = "⚠️ সার্ভারে সমস্যার কারণে পেমেন্ট নিতে পারবেন না।"
+        if alternatives:
+            msg += f"\nঅনুগ্রহ করে অন্য মাধ্যমে চেষ্টা করুন: {alternatives}।"
+        else:
+            msg += "\nবর্তমানে কোনো মাধ্যমই চালু নেই। অনুগ্রহ করে পরে চেষ্টা করুন।"
+            
+        reply_and_delete(query, context, msg)
+        return CHOOSE_METHOD
+
+    context.user_data['withdraw_method'] = method_name; user_details = context.user_data['user_details']
+    
+    schedule_message_deletion(context, query.message, query.from_user.id)
+
+    if method_name == 'Rocket':
+        reply_and_delete(query, context, f"দয়া করে আপনার Rocket নম্বর/আইডি দিন:", reply_markup=BACK_KEYBOARD)
+        return GET_TEMP_NUMBER
+
+    col_map = {'Bkash': BKASH_COL, 'Nagad': NAGAD_COL, 'Binance': BINANCE_COL}
+    col_index = col_map[method_name] - 1
+    saved_number = user_details[col_index].strip("'") if len(user_details) > col_index and user_details[col_index] else ""
+    
+    if saved_number:
+        context.user_data['withdraw_number'] = saved_number
+        keyboard = [[InlineKeyboardButton(f"✅ হ্যাঁ (`{saved_number}`)", callback_data="confirm_number")], [InlineKeyboardButton("✏️ অন্য নম্বর দিন", callback_data="change_number")]]
+        reply_and_delete(query, context, f"আপনার সেভ করা {method.capitalize()} নম্বর: `{saved_number}`\nএই নম্বরেই টাকা তুলবেন?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN); return ASK_AMOUNT
+    else:
+        reply_and_delete(query, context, f"আপনার কোনো {method.capitalize()} নম্বর সেভ করা নেই।")
+        reply_and_delete(query, context, f"দয়া করে আপনার {method.capitalize()} নম্বর/আইডি দিন:", reply_markup=BACK_KEYBOARD); return GET_TEMP_NUMBER
+
+def withdraw_confirm_number(update: Update, context: CallbackContext):
+    query = update.callback_query;
+    
+    user_id = query.from_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+    
+    query.answer(); balance = context.user_data['withdraw_balance']
+    method = context.user_data['withdraw_method']; prompt = f"আপনি কত টাকা তুলতে চান? (আপনার ব্যালেন্স ৳{balance})"
+    if method in ['Bkash', 'Nagad']: prompt += f"\n\n⚠️ *বিকাশ ও নগদে উত্তোলনের ক্ষেত্রে ৳{WITHDRAWAL_FEE} ফি প্রযোজ্য হবে।*"
+    
+    schedule_message_deletion(context, query.message, query.from_user.id)
+    
+    if query.data == "confirm_number":
+        reply_and_delete(query, context, prompt, reply_markup=BACK_KEYBOARD, parse_mode=ParseMode.MARKDOWN)
+        return ASK_AMOUNT
+    elif query.data == "change_number":
+        reply_and_delete(query, context, f"দয়া করে আপনার নতুন {method} নম্বর/আইডি দিন:"); return GET_TEMP_NUMBER
+
+def withdraw_get_temp_number(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    context.user_data['withdraw_number'] = f"'{update.message.text.strip()}"; balance = context.user_data['withdraw_balance']
+    method = context.user_data['withdraw_method']; prompt = f"আপনি কত টাকা তুলতে চান? (আপনার ব্যালেন্স ৳{balance})"
+    if method in ['Bkash', 'Nagad']: prompt += f"\n\n⚠️ *বিকাশ ও নগদে উত্তোলনের ক্ষেত্রে ৳{WITHDRAWAL_FEE} ফি প্রযোজ্য হবে।*"
+    reply_and_delete(update, context, prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=BACK_KEYBOARD); return ASK_AMOUNT
+def withdraw_get_amount(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    amount_text = update.message.text.strip(); balance = context.user_data['withdraw_balance']
+    method = context.user_data['withdraw_method']
+    try:
+        amount = float(amount_text)
+        if amount < 50: reply_and_delete(update, context, "❌ ন্যূনতম ৳৫০ তুলতে পারবেন।"); return ASK_AMOUNT
+        if amount > balance: reply_and_delete(update, context, f"❌ আপনার একাউন্টে পর্যাপ্ত ব্যালেন্স নেই।"); return ASK_AMOUNT
+    except ValueError: reply_and_delete(update, context, "❌ দয়া করে সঠিক সংখ্যায় টাকার পরিমাণ দিন।"); return ASK_AMOUNT
+    
+    context.user_data['withdraw_amount'] = amount
+    
+    # --- MESSAGE 1: PERMANENT CONFIRMATION (With Fee Calculation) ---
+    fee, amount_to_receive = (WITHDRAWAL_FEE, amount - WITHDRAWAL_FEE) if method in ['Bkash', 'Nagad'] else (0, amount)
+    
+    confirm_text = ""
+    if fee > 0:
+        confirm_text = f"✅ আপনার ৳{amount} তোলার অনুরোধ পাঠানো হয়েছে। ৳{fee} ফি কেটে নেওয়ার পর আপনি **৳{amount_to_receive}** পাবেন।"
+    else:
+        confirm_text = f"✅ আপনার ৳{amount} তোলার অনুরোধ পাঠানো হয়েছে।"
+        
+    # Sending permanent message (Not scheduling for deletion)
+    context.bot.send_message(chat_id=user_id, text=confirm_text, parse_mode=ParseMode.MARKDOWN)
+
+    # --- MESSAGE 2: ANIMATION & WARNING (To be auto-deleted later) ---
+    # 1. Send Processing Animation
+    msg = context.bot.send_message(chat_id=user_id, text="⏳ **আপনার রিকোয়েস্ট প্রসেসিং হচ্ছে...**", parse_mode=ParseMode.MARKDOWN)
+    time.sleep(1) 
+    
+    # 2. Final Warning Text with Admin Button
+    warning_text = (
+        "✅ **রিকোয়েস্ট সফলভাবে পাঠানো হয়েছে!**\n\n"
+        "⚠️ **জরুরি নোটিশ:**\n"
+        "২৪ ঘন্টার মধ্যেই যেই কোনো সময় পেমেন্ট রিকোয়েস্ট অ্যাপ্রুভ হবে।\n"
+        "তাই দয়া করে **২৪ ঘন্টার মধ্যেই কোনো প্রকার মেসেজ দিবেন না।**\n\n"
+        "যদি ২৪ ঘন্টার পরে পেমেন্ট রিকোয়েস্ট অ্যাপ্রুভ না হয় বা কেনসেল না করা হয়, "
+        "তবেই কেবল এডমিনের সঙ্গে যোগাযোগ করবেন এবং আপনার এজেন্ট কোড এডমিন কে দিবেন।\n\n"
+        f"👮‍♂️ **Admin ID:** `{ADMIN_IDS[0]}`"
+    )
+    
+    admin_contact_btn = [[InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=f"tg://user?id={ADMIN_IDS[0]}")]]
+    
+    sent_warning_msg = None
+    try:
+        # Edit the processing message to show the warning
+        sent_warning_msg = context.bot.edit_message_text(
+            chat_id=msg.chat_id,
+            message_id=msg.message_id,
+            text=warning_text,
+            reply_markup=InlineKeyboardMarkup(admin_contact_btn),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Error editing withdraw message: {e}")
+        # Fallback
+        sent_warning_msg = context.bot.send_message(chat_id=user_id, text=warning_text, reply_markup=InlineKeyboardMarkup(admin_contact_btn), parse_mode=ParseMode.MARKDOWN)
+
+    # Save the message ID to context so we can save it to DB later
+    if sent_warning_msg:
+        context.user_data['user_message_id'] = sent_warning_msg.message_id
+
+    send_withdrawal_request_to_admins(update, context)
+
+    context.user_data.clear()
+    if is_admin(update.effective_user.id): show_full_admin_menu(update)
+    else: show_main_menu(update)
+    return ConversationHandler.END
+
+def send_withdrawal_request_to_admins(update: Update, context: CallbackContext):
+    user_data = context.user_data; details = user_data['user_details']; user_telegram_id = update.effective_user.id
+    amount_requested = user_data['withdraw_amount']; method = user_data['withdraw_method']
+    agent_code = user_data['withdraw_code']
+    user_message_id = user_data.get('user_message_id') # Get the warning message ID
+    
+    fee, amount_to_receive = (WITHDRAWAL_FEE, amount_requested - WITHDRAWAL_FEE) if method in ['Bkash', 'Nagad'] else (0, amount_requested)
+    
+    epoch_time = int(time.time())
+    request_id = f"{user_telegram_id}_{epoch_time}"
+    
+    def safe_get(index, r_data): return r_data[index].strip("'") if index < len(r_data) and str(r_data[index]).strip() else "N/A"
+    text = (f"⚠️ **নতুন পেমেন্ট রিকোয়েস্ট** ⚠️\n\n👤 **নাম:** `{safe_get(NAME_COL - 1, details)}`\n🔑 **Agent Code:** `{agent_code}`\n\n💸 **Amount Requested:** `৳{amount_requested}`\n📉 **Fee:** `৳{fee}`\n💵 **User Will Receive:** `৳{amount_to_receive}`\n\n💳 **Method:** `{method}`\n#️⃣ **Number/ID:** `{user_data['withdraw_number'].strip()}`")
+    
+    callback_data_approve = f"pay:{request_id}:{agent_code}:{amount_requested}:{user_telegram_id}"
+    callback_data_cancel = f"cancel:{request_id}:{agent_code}:{amount_requested}:{user_telegram_id}"
+    keyboard = [[InlineKeyboardButton("✅ Payment Done", callback_data=callback_data_approve), InlineKeyboardButton("❌ Cancel", callback_data=callback_data_cancel)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_references = []
+    if PRIVATE_CHANNEL_ID and PRIVATE_CHANNEL_ID != 0:
+        try: 
+            msg = context.bot.send_message(chat_id=PRIVATE_CHANNEL_ID, text=text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+            message_references.append((msg.chat_id, msg.message_id))
+        except Exception as e: logger.error(f"Failed to send request to private channel {PRIVATE_CHANNEL_ID}: {e}")
+    for admin_id in ADMIN_IDS:
+        try: 
+            msg = context.bot.send_message(chat_id=admin_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+            message_references.append((msg.chat_id, msg.message_id))
+        except Exception as e: logger.error(f"Failed to send request to admin {admin_id}: {e}")
+            
+    if 'withdrawal_requests' not in context.bot_data:
+        context.bot_data['withdrawal_requests'] = {}
+    context.bot_data['withdrawal_requests'][request_id] = message_references
+
+    try:
+        # Insert Agent Code and User Message ID into DB
+        cur.execute("INSERT INTO payment_history (request_id, user_id, agent_code, status, amount, timestamp, user_message_id) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                    (request_id, user_telegram_id, agent_code, "⏳ পেন্ডিং", amount_requested, epoch_time, user_message_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to write pending request to DB: {e}")
+
+
+def handle_payment_action(update: Update, context: CallbackContext):
+    query = update.callback_query; admin_user = query.from_user; query.answer()
+    
+    try: action, request_id, agent_code, amount_str, user_id_str = query.data.split(':')
+    except ValueError: logger.error(f"Could not unpack callback_data: {query.data}"); return
+            
+    if action == 'cancel':
+        context.user_data.update({'request_id': request_id, 'agent_code': agent_code, 'amount': float(amount_str), 'user_id': int(user_id_str), 'original_message_text': query.message.text_markdown})
+        keyboard = [[InlineKeyboardButton("✍️ কারণ লিখুন", callback_data="cancel_with_reason")], [InlineKeyboardButton("⏩ কারণ নেই", callback_data="cancel_no_reason")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        sent_message = query.edit_message_text("আপনি কি বাতিলের কারণ উল্লেখ করতে চান?", reply_markup=reply_markup)
+        context.user_data['last_bot_message'] = sent_message
+        return CHOOSE_CANCEL_OPTION
+
+    amount = float(amount_str); user_id = int(user_id_str)
+    final_text = ""
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if not cell:
+        final_text = query.message.text_markdown + f"\n\n❌ **ত্রুটি:** Agent Code `{agent_code}` পাওয়া যায়নি।"
+    else:
+        try:
+            row_index = cell.row
+            if action == 'pay':
+                current_balance = float((user_sheet.cell(row_index, BALANCE_COL).value or "0").replace(',', ''))
+                if current_balance < amount:
+                     final_text = query.message.text_markdown + f"\n\n⚠️ **ব্যালেন্স কম!** (처리자: {admin_user.first_name})"
+                     if not is_blocked_db(user_id):
+                        context.bot.send_message(user_id, "❌ আপনার পেমেন্ট বাতিল হয়েছে কারণ একাউন্টে পর্যাপ্ত ব্যালেন্স নেই।")
+                     cur.execute("UPDATE payment_history SET status = ? WHERE request_id = ?", ("❌ বাতিল (ব্যালেন্স কম)", request_id))
+                else:
+                    new_balance = current_balance - amount; user_sheet.update_cell(row_index, BALANCE_COL, new_balance)
+                    final_text = query.message.text_markdown + f"\n\n✅ **পেমেন্ট সফল!** (처리자: {admin_user.first_name})"
+                    
+                    # --- AUTO DELETE USER MESSAGE START ---
+                    try:
+                        cur.execute("SELECT user_message_id FROM payment_history WHERE request_id = ?", (request_id,))
+                        result = cur.fetchone()
+                        if result and result[0]:
+                            context.bot.delete_message(chat_id=user_id, message_id=result[0])
+                    except Exception as e:
+                        logger.warning(f"Could not auto-delete user message on approve: {e}")
+                    # --- AUTO DELETE USER MESSAGE END ---
+
+                    if not is_blocked_db(user_id):
+                        context.bot.send_message(user_id, f"✅ আপনার ৳{amount} এর পেমেন্ট সফল হয়েছে। নতুন ব্যালেন্স ৳{new_balance}।")
+                    
+                    # Update status AND timestamp to CURRENT time so 24hr count starts NOW
+                    current_ts = int(time.time())
+                    cur.execute("UPDATE payment_history SET status = ?, timestamp = ? WHERE request_id = ?", ("✅ অ্যাপ্রুভড", current_ts, request_id))
+            conn.commit()
+        except Exception as e: 
+            logger.error(f"Error in handle_payment_action (pay): {e}")
+            final_text = query.message.text_markdown + "\n\n❌ **একটি মারাত্মক ত্রুটি ঘটেছে।**"
+    
+    message_references = context.bot_data.get('withdrawal_requests', {}).pop(request_id, [])
+    for chat_id, message_id in message_references:
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Failed to edit message {message_id} in chat {chat_id}: {e}")
+
+def finalize_cancellation(context: CallbackContext, admin_user, reason: str = None):
+    request_id = context.user_data.get('request_id'); amount = context.user_data.get('amount')
+    user_id = context.user_data.get('user_id'); original_message_text = context.user_data.get('original_message_text', '')
+    
+    # --- AUTO DELETE USER MESSAGE START ---
+    try:
+        cur.execute("SELECT user_message_id FROM payment_history WHERE request_id = ?", (request_id,))
+        result = cur.fetchone()
+        if result and result[0]:
+            context.bot.delete_message(chat_id=user_id, message_id=result[0])
+    except Exception as e:
+        logger.warning(f"Could not auto-delete user message on cancel: {e}")
+    # --- AUTO DELETE USER MESSAGE END ---
+
+    user_message = f"দুঃখিত, আপনার ৳{amount} এর পেমেন্ট রিকোয়েস্ট বাতিল করা হয়েছে।"
+    if reason: user_message += f"\n\nকারণ: {reason}"
+    
+    if user_id and not is_blocked_db(user_id):
+        context.bot.send_message(user_id, user_message)
+    
+    status_text = f"❌ বাতিল ({reason})" if reason else "❌ বাতিল করা হয়েছে"
+    try:
+        cur.execute("UPDATE payment_history SET status = ? WHERE request_id = ?", (status_text, request_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to update cancelled status in DB: {e}")
+
+    final_text_for_admin = original_message_text + f"\n\n❌ **পেমেন্ট বাতিল হয়েছে।** (처리자: {admin_user.first_name})"
+    if reason: final_text_for_admin += f"\nকারণ: {reason}"
+    message_references = context.bot_data.get('withdrawal_requests', {}).pop(request_id, [])
+    for chat_id, message_id in message_references:
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text_for_admin, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Failed to edit message {message_id} in chat {chat_id}: {e}")
+
+def handle_cancel_option(update: Update, context: CallbackContext):
+    query = update.callback_query; query.answer()
+    admin_user = query.from_user
+    if query.data == "cancel_no_reason":
+        query.edit_message_text("বাতিল করা হচ্ছে...")
+        finalize_cancellation(context, admin_user); return ConversationHandler.END
+    elif query.data == "cancel_with_reason":
+        sent_message = query.edit_message_text("অনুগ্রহ করে বাতিলের কারণটি লিখে পাঠান:")
+        context.user_data['last_bot_message'] = sent_message; return GET_CANCEL_REASON
+
+def get_cancel_reason(update: Update, context: CallbackContext):
+    reason = update.message.text; admin_user = update.message.from_user
+    schedule_message_deletion(context, update.message, admin_user.id)
+    if 'last_bot_message' in context.user_data:
+        try: 
+            context.bot.delete_message(chat_id=context.user_data['last_bot_message'].chat_id, 
+                                       message_id=context.user_data['last_bot_message'].message_id)
+        except Exception: pass
+    finalize_cancellation(context, admin_user, reason=reason)
+    return ConversationHandler.END
+
+def admin_get_details_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "🔍 কার প্রোফাইল দেখতে চান? তার Agent Code দিন:", reply_markup=BACK_KEYBOARD); return ADMIN_GET_DETAILS_CODE
+
+def admin_handle_get_details_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if not cell:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি।"); return cancel_and_show_menu(update, context)
+    
+    row_data = user_sheet.row_values(cell.row)
+    def safe_get(index, r_data): return r_data[index].strip("'") if index < len(r_data) and str(r_data[index]).strip() else "নাই"
+    
+    status_text = safe_get(STATUS_COL - 1, row_data)
+    status_display = f"🚨 **Status:** `{status_text}`\n\n" if status_text == "Blocked" else ""
+
+    reply_text = (
+        "📋 **সম্পূর্ণ প্রোফাইল (Admin View)** 📋\n\n"
+        f"{status_display}"
+        f"*Timestamp:* `{safe_get(TIMESTAMP_COL - 1, row_data)}`\n" f"📧 *Gmail:* `{safe_get(GMAIL_COL - 1, row_data)}`\n"
+        f"👤 *Name:* `{safe_get(NAME_COL - 1, row_data)}`\n\n" f"📱 *WhatsApp:* `{safe_get(WHATSAPP_COL - 1, row_data)}`\n"
+        f"💬 *Telegram:* `{safe_get(TELEGRAM_COL - 1, row_data)}`\n\n" f"💳 *Bkash:* `{safe_get(BKASH_COL - 1, row_data)}`\n"
+        f"💳 *Nagad:* `{safe_get(NAGAD_COL - 1, row_data)}`\n" f"🏦 *Binance ID:* `{safe_get(BINANCE_COL - 1, row_data)}`\n"
+        f"🔐 *Password:* `{safe_get(PASSWORD_COL - 1, row_data)}`\n\n" f"🔑 **Agent Code:** `{safe_get(AGENT_CODE_COL - 1, row_data)}`\n"
+        f"💰 **Balance:** `৳{safe_get(BALANCE_COL - 1, row_data) or 0}`"
+    )
+    update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+    return cancel_and_show_menu(update, context)
+
+def get_user_count(update: Update, context: CallbackContext):
+    if not is_admin(update.effective_user.id): return
+    try:
+        cur.execute("SELECT COUNT(*) FROM verified_users")
+        verified_count = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM blocked_users")
+        blocked_count = cur.fetchone()[0]
+        reply_text = f"🤖 বর্তমানে মোট ভেরিফাইড ইউজার: {verified_count} জন\n"
+        reply_text += f"🚫 মোট ব্লকড ইউজার: {blocked_count} জন"
+        reply_and_delete(update, context, reply_text)
+
+    except Exception as e:
+        logger.error(f"Error getting user count: {e}")
+        reply_and_delete(update, context, "❌ ইউজার সংখ্যা গণনায় সমস্যা হয়েছে।")
+
+def broadcast_start(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    reply_and_delete(update, context, "📢 আপনি সকল ইউজারকে যে মেসেজটি পাঠাতে চান, সেটি লিখুন:", reply_markup=BACK_KEYBOARD)
+    return BROADCAST_MESSAGE
+
+def broadcast_get_message(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    context.user_data['broadcast_message'] = update.message.text
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("✅ হ্যাঁ")], [KeyboardButton("❌ না")]], resize_keyboard=True, one_time_keyboard=True)
+    reply_and_delete(update, context, "আপনি কি এই মেসেজটি সকল ভেরিফাইড ইউজারকে (ব্লকড ইউজার বাদে) পাঠাতে চান?\n\n(এই কাজটি সম্পন্ন হতে সময় লাগতে পারে এবং এটি বাতিল করা যাবে না)", reply_markup=keyboard)
+    return BROADCAST_CONFIRM
+
+def broadcast_confirm(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    if update.message.text == "✅ হ্যাঁ":
+        message_to_send = context.user_data.get('broadcast_message')
+        if not message_to_send:
+            reply_and_delete(update, context, "❌ কোনো মেসেজ পাওয়া যায়নি। প্রক্রিয়াটি বাতিল করা হলো।")
+            return cancel_and_show_menu(update, context)
+        
+        reply_and_delete(update, context, "...ব্রডকাস্ট শুরু হচ্ছে... অনুগ্রহ করে অপেক্ষা করুন...")
+        
+        cur.execute("""
+            SELECT v.user_id 
+            FROM verified_users v
+            LEFT JOIN blocked_users b ON v.user_id = b.user_id
+            WHERE b.user_id IS NULL
+        """)
+        
+        users = cur.fetchall()
+        success_count = 0
+        fail_count = 0
+        
+        for user in users:
+            user_id = user[0]
+            try:
+                context.bot.send_message(chat_id=user_id, text=message_to_send)
+                success_count += 1
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Failed to send broadcast to {user_id}: {e}")
+                fail_count += 1
+        
+        reply_and_delete(update, context, f"✅ ব্রডকাস্ট সম্পন্ন!\n\nসফলভাবে পাঠানো হয়েছে: {success_count} জন\nব্যর্থ হয়েছে: {fail_count} জন")
+    else:
+        reply_and_delete(update, context, "❌ ব্রডকাস্ট বাতিল করা হয়েছে।")
+        
+    return cancel_and_show_menu(update, context)
+
+def check_payment_status(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return
+    
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    
+    try:
+        thirty_days_ago_epoch = int(time.time()) - (30 * 24 * 60 * 60)
+        cur.execute("SELECT status, amount, timestamp FROM payment_history WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp DESC", 
+                    (user_id, thirty_days_ago_epoch))
+        records = cur.fetchall()
+
+        if not records:
+            reply_and_delete(update, context, "আপনার শেষ ৩০ দিনে কোনো পেমেন্ট রিকোয়েস্ট পাওয়া যায়নি।")
+        else:
+            reply_text = "📊 আপনার শেষ ৩০ দিনের পেমেন্ট স্ট্যাটাস:\n\n"
+            for (status, amount, ts) in records:
+                time_str = datetime.fromtimestamp(ts).strftime("%d/%m/%y %I:%M %p")
+                reply_text += f"স্ট্যাটাস: {status}\nঅ্যামাউন্ট: ৳{amount}\nসময়: {time_str}\n---------------------\n"
+            reply_and_delete(update, context, reply_text)
+    except Exception as e:
+        logger.error(f"Error fetching payment history: {e}")
+        reply_and_delete(update, context, "❌ স্ট্যাটাস দেখতে সমস্যা হচ্ছে।")
+
+def show_notice(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return
+
+    if not is_channel_member(update.effective_user.id, context):
+        force_reverify(update, context); return
+    
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    notice = context.bot_data.get('notice', 'বর্তমানে কোনো নতুন নোটিশ নেই।')
+    reply_and_delete(update, context, f"🎁 **অফার/নোটিশ** 🎁\n\n{notice}", parse_mode=ParseMode.MARKDOWN)
+
+def set_notice_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "✍️ নতুন নোটিশটি লিখুন। 'clear' লিখলে নোটিশ মুছে যাবে।", reply_markup=BACK_KEYBOARD)
+    return SET_NOTICE_TEXT
+
+def get_notice_text(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    notice_text = update.message.text
+    if notice_text.lower() == 'clear':
+        context.bot_data.pop('notice', None)
+        reply_and_delete(update, context, "✅ নোটিশ সফলভাবে মুছে ফেলা হয়েছে।")
+    else:
+        context.bot_data['notice'] = notice_text
+        reply_and_delete(update, context, "✅ নতুন নোটিশ সফলভাবে সেট করা হয়েছে।")
+    return cancel_and_show_menu(update, context)
+
+# --- (ADMIN) BLOCK USER ---
+def block_user_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "🚫 কোন ইউজারকে ব্লক করতে চান? তার Agent Code দিন:", reply_markup=BACK_KEYBOARD)
+    return BLOCK_USER_CODE
+
+def block_user_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    
+    if not cell:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি। আবার চেষ্টা করুন।")
+        return BLOCK_USER_CODE
+    
+    context.user_data.update({'block_row': cell.row, 'block_agent_code': agent_code})
+    reply_and_delete(update, context, "✍️ ব্লক করার কারণ দিন (এই কারণটি ইউজারকে দেখানো হবে):")
+    return BLOCK_USER_REASON
+
+def block_user_get_reason(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reason = update.message.text.strip()
+    row = context.user_data['block_row']
+    agent_code = context.user_data['block_agent_code']
+    admin_user = update.message.from_user
+    
+    try:
+        user_sheet.update_cell(row, STATUS_COL, "Blocked")
+        
+        user_id_str = user_sheet.cell(row, USER_ID_COL).value
+        user_id_to_block = None
+        if user_id_str and user_id_str.isdigit():
+            user_id_to_block = int(user_id_str)
+            block_user_db(user_id_to_block, reason)
+        
+        reply_text = f"✅ Agent Code `{agent_code}` সফলভাবে ব্লক করা হয়েছে।"
+        if user_id_to_block:
+            reply_text += f"\nসংশ্লিষ্ট Telegram ID: `{user_id_to_block}`-কেও ব্লক করা হয়েছে।"
+        else:
+            reply_text += "\n(এই কোডের সাথে কোনো Telegram ID যুক্ত ছিলো না)"
+        
+        reply_and_delete(update, context, reply_text, parse_mode=ParseMode.MARKDOWN)
+
+        if user_id_to_block:
+            try:
+                blocked_text = (
+                    "🚨 **আপনি ব্লকড** 🚨\n\n"
+                    "আপনি নিয়ম ভাঙ্গা কারণে আপনার একাউন্ট এবং আপনার এজেন্ট কোড ব্লক করে দেওয়া হয়েছে।\n\n"
+                    f"**কারণ:** {reason}\n\n"
+                    "যতক্ষণ না এডমিন আনব্লক করবে ততক্ষণ এই এজেন্ট কোড বা এই আইডি ব্যবহার করে কাজ করতে পারবেন না। "
+                    "আপনি আনব্লক করতে চাইলে এডমিনের সঙ্গে যোগাযোগ করুন।"
+                )
+                keyboard = [[InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=f"tg://user?id={ADMIN_IDS[0]}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                context.bot.send_message(chat_id=user_id_to_block, text=blocked_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+                logger.info(f"Sent block notification to user {user_id_to_block}")
+            except Exception as e:
+                logger.warning(f"User {user_id_to_block} blocked, but could not send notification: {e}")
+
+    except Exception as e:
+        logger.error(f"Error during block process for {agent_code}: {e}")
+        reply_and_delete(update, context, f"❌ `{agent_code}` ব্লক করার সময় একটি ত্রুটি হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+        
+    return cancel_and_show_menu(update, context)
+
+# --- (ADMIN) UNBLOCK USER ---
+def unblock_user_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "✅ কোন ইউজারকে আনব্লক করতে চান? তার Agent Code দিন:", reply_markup=BACK_KEYBOARD)
+    return UNBLOCK_USER_CODE
+
+def unblock_user_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    
+    if not cell:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি। আবার চেষ্টা করুন।")
+        return UNBLOCK_USER_CODE
+    
+    row = cell.row
+    unblocked_user_ids = set() 
+
+    try:
+        user_sheet.update_cell(row, STATUS_COL, "") 
+        
+        user_id_str_original = user_sheet.cell(row, USER_ID_COL).value
+        if user_id_str_original and user_id_str_original.isdigit():
+            user_id_to_unblock = int(user_id_str_original)
+            unblock_user_db(user_id_to_unblock) 
+            unblocked_user_ids.add(user_id_to_unblock)
+        
+        search_term = f"%{agent_code}%" 
+        cur.execute("SELECT user_id FROM blocked_users WHERE reason LIKE ?", (search_term,))
+        subsequent_users = cur.fetchall()
+        
+        if subsequent_users:
+            for user in subsequent_users:
+                unblocked_user_ids.add(user[0])
+            
+            cur.execute("DELETE FROM blocked_users WHERE reason LIKE ?", (search_term,))
+            conn.commit()
+            logger.info(f"Unblocked {len(subsequent_users)} subsequent users for code {agent_code}")
+            
+        clear_fail_count(agent_code)
+
+        total_unblocked = len(unblocked_user_ids)
+        reply_text = f"✅ Agent Code `{agent_code}` সফলভাবে আনব্লক করা হয়েছে।"
+        if total_unblocked > 0:
+            reply_text += f"\nসংশ্লিষ্ট {total_unblocked} টি Telegram ID-কেও আনব্লক করা হয়েছে।"
+        else:
+            reply_text += "\n(এই কোডের সাথে কোনো Telegram ID যুক্ত ছিলো না বা DB-তে পাওয়া যায়নি)"
+        
+        reply_and_delete(update, context, reply_text, parse_mode=ParseMode.MARKDOWN)
+
+        for user_id in unblocked_user_ids:
+            try:
+                context.bot.send_message(chat_id=user_id, text="✅ আপনার একাউন্টটি অ্যাডমিন আনব্লক করেছে। আপনি এখন বটটি ব্যবহার করতে পারেন।")
+                logger.info(f"Sent unblock notification to user {user_id}")
+            except Exception as e:
+                logger.warning(f"User {user_id} unblocked, but could not send notification: {e}")
+
+    except Exception as e:
+        logger.error(f"Error during unblock process for {agent_code}: {e}")
+        reply_and_delete(update, context, f"❌ `{agent_code}` আনব্লক করার সময় একটি ত্রুটি হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+        
+    return cancel_and_show_menu(update, context)
+
+# --- RESET PASSWORD HANDLERS ---
+def reset_password_start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if is_blocked_db(user_id):
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+        
+    if not is_channel_member(user_id, context):
+        force_reverify(update, context); return ConversationHandler.END
+        
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "🔑 পাসওয়ার্ড রিসেট করার জন্য আপনার **Agent Code** দিন:", reply_markup=BACK_KEYBOARD)
+    return RESET_CODE
+
+def reset_password_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    user_id = update.message.from_user.id
+    
+    if get_fail_count(agent_code) >= 3:
+        reason = f"3 times wrong details for code {agent_code}"
+        cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+        if cell:
+             user_sheet.update_cell(cell.row, STATUS_COL, "Blocked")
+             
+        block_user_db(user_id, reason)
+        show_blocked_message(update, context)
+        return ConversationHandler.END
+
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if not cell:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি। আবার চেষ্টা করুন।")
+        return RESET_CODE
+    
+    try:
+        status = user_sheet.cell(cell.row, STATUS_COL).value
+        if status == "Blocked":
+            block_user_db(user_id, f"Attempted access to blocked code {agent_code}")
+            show_blocked_message(update, context)
+            return ConversationHandler.END
+    except Exception: pass
+
+    row_values = user_sheet.row_values(cell.row)
+    saved_user_id_raw = row_values[USER_ID_COL-1] if len(row_values) >= USER_ID_COL else ""
+    saved_user_id = str(saved_user_id_raw).strip("'").strip()
+    current_user_id = str(user_id)
+    
+    if saved_user_id and saved_user_id != current_user_id:
+        reply_and_delete(update, context, "❌ দুঃখিত! শুধুমাত্র যেই একাউন্ট দিয়ে এজেন্ট কোড এবং পাসওয়ার্ড নিয়েছেন সেই একাউন্ট দিয়ে রিসেট করতে পারবেন।")
+        return cancel_and_show_menu(update, context)
+
+    field_map = {
+        2: "Email address",
+        3: "Name",
+        4: "WhatsApp Number",
+        5: "Telegram Number/ID",
+        6: "Bkash Number",
+        7: "Nagad Number",
+    }
+    
+    valid_indices = []
+    for idx, col_name in field_map.items():
+        val = row_values[idx-1] if len(row_values) >= idx else ""
+        if val and str(val).strip():
+            valid_indices.append(idx)
+            
+    if not valid_indices:
+        reply_and_delete(update, context, "❌ আপনার একাউন্টে পর্যাপ্ত তথ্য নেই ভেরিফিকেশনের জন্য। এডমিনের সাথে যোগাযোগ করুন।")
+        return cancel_and_show_menu(update, context)
+        
+    selected_idx = random.choice(valid_indices)
+    field_name = field_map[selected_idx]
+    expected_value = row_values[selected_idx-1].strip("'").strip()
+    
+    context.user_data['reset_row'] = cell.row
+    context.user_data['reset_agent_code'] = agent_code
+    context.user_data['reset_expected'] = expected_value
+    context.user_data['reset_field'] = field_name
+    
+    reply_and_delete(update, context, f"🔒 ভেরিফিকেশন: আপনার রেজিস্ট্রেশন করার সময় দেওয়া **{field_name}** টি দিন:", parse_mode=ParseMode.MARKDOWN)
+    return RESET_VERIFY
+
+def reset_password_verify(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    user_input = update.message.text.strip()
+    expected = context.user_data.get('reset_expected')
+    agent_code = context.user_data.get('reset_agent_code')
+    user_id = update.effective_user.id
+    
+    if user_input.lower() == expected.lower():
+        reply_and_delete(update, context, "✅ তথ্য সঠিক! দয়া করে আপনার নতুন ৫-৮ অক্ষরের পাসওয়ার্ডটি দিন:")
+        return RESET_NEW_PASS
+    else:
+        count = increment_fail_count(agent_code)
+        if count >= 3:
+            row = context.user_data.get('reset_row')
+            user_sheet.update_cell(row, STATUS_COL, "Blocked")
+            block_user_db(user_id, f"3 times wrong details for code {agent_code}")
+            
+            reason = "আপনি ৩বার ভুল ডিটেল দেওয়ার জন্য ব্লক করে দেওয়া হয়েছে।"
+            text = (
+                "🚨 **আপনি ব্লকড** 🚨\n\n"
+                f"{reason}\n\n"
+                "আপনি আনব্লক করতে চাইলে এডমিনের সঙ্গে যোগাযোগ করুন।"
+            )
+            keyboard = [[InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=f"tg://user?id={ADMIN_IDS[0]}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+            
+            return ConversationHandler.END
+        else:
+            reply_and_delete(update, context, f"❌ ভুল তথ্য! (চেষ্টা: {count}/3)\nদয়া করে আবার '🔑 পাসওয়ার্ড রিসেট' এ ক্লিক করে সঠিক তথ্য দিন।")
+            return cancel_and_show_menu(update, context)
+
+def reset_password_set_new(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    new_password = update.message.text.strip()
+    
+    if not (5 <= len(new_password) <= 8):
+        reply_and_delete(update, context, "❌ পাসওয়ার্ডটি অবশ্যই ৫ থেকে ৮ অক্ষরের মধ্যে হতে হবে। আবার চেষ্টা করুন:")
+        return RESET_NEW_PASS
+        
+    row = context.user_data['reset_row']
+    agent_code = context.user_data['reset_agent_code']
+    
+    try:
+        user_sheet.update_cell(row, PASSWORD_COL, f"'{new_password}")
+        clear_fail_count(agent_code)
+        reply_and_delete(update, context, "✅ আপনার পাসওয়ার্ড সফলভাবে পরিবর্তন করা হয়েছে। এখন আপনি নতুন পাসওয়ার্ড দিয়ে কাজ করতে পারবেন।")
+    except Exception as e:
+        logger.error(f"Reset password update error: {e}")
+        reply_and_delete(update, context, "⚠️ পাসওয়ার্ড আপডেট করতে সমস্যা হয়েছে।")
+        
+    return cancel_and_show_menu(update, context)
+
+# --- Payment Method Control Handler ---
+def method_control_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    show_method_control_panel(update, context)
+    return METHOD_CONTROL
+
+def show_method_control_panel(update_or_query, context: CallbackContext):
+    keyboard = []
+    for method in ['Bkash', 'Nagad', 'Rocket', 'Binance']:
+        status = is_method_active(method)
+        icon = "✅" if status else "❌"
+        text = f"{icon} {method}"
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"toggle_{method}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="admin_back")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = "⚙️ **পেমেন্ট মেথড কন্ট্রোল প্যানেল**\n\nযেই মেথডটি চালু বা বন্ধ করতে চান সেটিতে ক্লিক করুন:"
+    
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+         update_or_query.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    elif hasattr(update_or_query, 'callback_query') and update_or_query.callback_query:
+         update_or_query.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+def handle_method_toggle(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    
+    if query.data == "admin_back":
+        query.delete_message()
+        return ConversationHandler.END
+        
+    method_name = query.data.split('_')[1]
+    new_status = toggle_method_status(method_name)
+    
+    status_text = "চালু" if new_status else "বন্ধ"
+    query.answer(f"{method_name} এখন {status_text} করা হয়েছে।")
+    
+    show_method_control_panel(update, context)
+    return METHOD_CONTROL
+
+# --- Payment Fix Handler ---
+def fix_payment_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "🔧 যার পেমেন্ট আটকে আছে তার **Agent Code** দিন:", reply_markup=BACK_KEYBOARD)
+    return FIX_PAYMENT_CODE
+
+def fix_payment_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    
+    # 1. Find User ID from Sheet
+    cell = find_cell_robust(agent_code, in_column=AGENT_CODE_COL)
+    if not cell:
+        reply_and_delete(update, context, "❌ এই Agent Code টি পাওয়া যায়নি।")
+        return FIX_PAYMENT_CODE
+        
+    user_id_str = user_sheet.cell(cell.row, USER_ID_COL).value
+    if not user_id_str or not user_id_str.isdigit():
+        reply_and_delete(update, context, "❌ এই কোডের সাথে কোনো Telegram ID পাওয়া যায়নি।")
+        return cancel_and_show_menu(update, context)
+        
+    user_id = int(user_id_str)
+    
+    # 2. Update DB status from Pending to Approved (or any non-pending state)
+    try:
+        cur.execute("SELECT COUNT(*) FROM payment_history WHERE user_id = ? AND status = '⏳ পেন্ডিং'", (user_id,))
+        count = cur.fetchone()[0]
+        
+        if count == 0:
+            reply_and_delete(update, context, "ℹ️ এই ইউজারের কোনো পেন্ডিং পেমেন্ট পাওয়া যায়নি।")
+        else:
+            cur.execute("UPDATE payment_history SET status = '✅ ম্যানুয়াল ফিক্স' WHERE user_id = ? AND status = '⏳ পেন্ডিং'", (user_id,))
+            conn.commit()
+            reply_and_delete(update, context, f"✅ সফল! {count} টি আটকে থাকা পেমেন্ট ক্লিয়ার করা হয়েছে।\nইউজার এখন নতুন রিকোয়েস্ট দিতে পারবে।")
+            
+            # Optional: Notify user
+            try:
+                context.bot.send_message(chat_id=user_id, text="✅ আপনার আটকে থাকা পেমেন্ট স্ট্যাটাস ঠিক করা হয়েছে। আপনি এখন আবার চেষ্টা করতে পারেন।")
+            except Exception:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Fix payment error: {e}")
+        reply_and_delete(update, context, "❌ ডাটাবেস আপডেট করতে সমস্যা হয়েছে।")
+        
+    return cancel_and_show_menu(update, context)
+
+# --- Add Money History Handlers ---
+def view_add_history_start(update: Update, context: CallbackContext):
+    if not is_admin(update.message.from_user.id): return ConversationHandler.END
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    reply_and_delete(update, context, "💰 যার জমার হিস্ট্রি দেখতে চান তার **Agent Code** দিন:", reply_markup=BACK_KEYBOARD)
+    return VIEW_ADD_HISTORY_CODE
+
+def view_add_history_get_code(update: Update, context: CallbackContext):
+    schedule_message_deletion(context, update.message, update.message.from_user.id)
+    agent_code = update.message.text.strip()
+    
+    try:
+        cur.execute("SELECT amount, source, date_text, rate_text, timestamp FROM add_money_history WHERE agent_code = ? ORDER BY timestamp DESC LIMIT 20", (agent_code,))
+        rows = cur.fetchall()
+        
+        if not rows:
+            reply_and_delete(update, context, f"❌ Agent Code `{agent_code}` এর কোনো জমার হিস্ট্রি পাওয়া যায়নি।", parse_mode=ParseMode.MARKDOWN)
+        else:
+            msg = f"📋 **জমার হিস্ট্রি (Agent: `{agent_code}`)**\n(সর্বশেষ ২০টি)\n\n"
+            for row in rows:
+                amount, source, date_text, rate, ts = row
+                time_str = datetime.fromtimestamp(ts).strftime("%d/%m/%y %I:%M %p")
+                msg += (f"📅 তারিখ: {date_text}\n"
+                        f"💰 পরিমাণ: ৳{amount}\n"
+                        f"📝 কিসের টাকা: {source}\n"
+                        f"💵 রেট: {rate}\n"
+                        f"⏰ সিস্টেম টাইম: {time_str}\n"
+                        f"-----------------------------\n")
+            
+            if len(msg) > 4000:
+                chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+                for chunk in chunks:
+                    update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            else:
+                update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+                
+    except Exception as e:
+        logger.error(f"View history error: {e}")
+        reply_and_delete(update, context, "❌ হিস্ট্রি দেখতে সমস্যা হয়েছে।")
+        
+    return cancel_and_show_menu(update, context)
+
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True, workers=32); dp = updater.dispatcher
+    cancel_filter = Filters.regex(f'^{BACK_BUTTON_TEXT}$')
+    
+    all_menu_buttons_regex = r'^(🔑 কোড পান|📋 Agent Code দিয়ে ডিটেল চেক|💰 আমার একাউন্ট|💸 টাকা তুলুন \(Withdraw\)|' \
+                             r'\(পাসওয়ার্ড & পেমেন্ট নম্বর পরিবর্তন\)|📊 পেমেন্ট স্ট্যাটাস|🎁 অফার/নোটিশ|' \
+                             r'🔗 ফর্ম পূরণ করুন|ℹ️ হেল্প|➕ টাকা এড করুন|➖ টাকা কমান|🔍 ইউজার ডিটেলস|📢 ব্রডকাস্ট|' \
+                             r'✍️ নোটিশ সেট করুন|🚫 ব্লক করুন|✅ আনব্লক করুন|🔑 পাসওয়ার্ড রিসেট|⚙️ পেমেন্ট মেথড কন্ট্রোল|🔧 পেমেন্ট ফিক্স|💰 জমার হিস্ট্রি|⚙️ অন্যান্য অপশন|🔙 মেইন মেনু|➕ বাল্ক টাকা এড)$'
+    
+    all_menu_filter = Filters.regex(all_menu_buttons_regex)
+
+    add_money_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^➕ টাকা এড করুন$'), add_money_start)], 
+        states={
+            ADD_MONEY_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, add_money_get_code)], 
+            ADD_MONEY_AMOUNT: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, add_money_get_amount)],
+            GET_ADD_SOURCE: [MessageHandler(Filters.text & ~cancel_filter, get_add_source)],
+            GET_ADD_DATE: [MessageHandler(Filters.text & ~cancel_filter, get_add_date)],
+            GET_ADD_RATE: [MessageHandler(Filters.text & ~cancel_filter, get_add_rate)],
+        }, 
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    # --- UPDATED HANDLER FOR BULK ADD MONEY ---
+    bulk_add_money_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^➕ বাল্ক টাকা এড$'), bulk_add_start)], 
+        states={
+            BULK_SETUP_DEFAULTS: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_bulk_defaults)],
+            BULK_PROCESS_LIST: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_bulk_process)]
+        }, 
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    subtract_money_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^➖ টাকা কমান$'), subtract_money_start)], states={SUBTRACT_MONEY_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, subtract_money_get_code)], SUBTRACT_MONEY_AMOUNT: [MessageHandler(Filters.text & ~cancel_filter, subtract_money_get_amount)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    get_code_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^🔑 কোড পান$'), get_code_start)], states={GET_CODE_GMAIL: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_get_code_gmail)], SET_NEW_PASSWORD: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_set_new_password)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    balance_check_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^💰 আমার একাউন্ট$'), balance_check_start)], states={BALANCE_CHECK_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_balance_check_code)], VERIFY_PASS_FOR_BALANCE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, verify_password_for_balance)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    get_details_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^📋 Agent Code দিয়ে ডিটেল চেক$'), get_details_start)], states={GET_DETAILS_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_get_details_code)], VERIFY_PASS_FOR_DETAILS: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, verify_password_for_details)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    
+    update_info_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex(r'^\(পাসওয়ার্ড & পেমেন্ট নম্বর পরিবর্তন\)$'), update_info_start)], states={UPDATE_INFO_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_update_info_code)], VERIFY_PASS_FOR_UPDATE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, verify_password_for_update)], CHOOSE_INFO_FIELD: [CallbackQueryHandler(update_info_choose_field, pattern='^update_')], GET_NEW_INFO: [MessageHandler(Filters.text & ~cancel_filter, update_info_get_new_value)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    
+    withdraw_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^💸 টাকা তুলুন \(Withdraw\)$'), withdraw_start)], states={WITHDRAW_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, handle_withdraw_code)], VERIFY_PASS_FOR_WITHDRAW: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, verify_password_for_withdraw)], CHOOSE_METHOD: [CallbackQueryHandler(withdraw_choose_method, pattern='^withdraw_')], ASK_AMOUNT: [CallbackQueryHandler(withdraw_confirm_number, pattern='^(confirm|change)_number$'), MessageHandler(Filters.text & ~cancel_filter, withdraw_get_amount)], GET_TEMP_NUMBER: [MessageHandler(Filters.text & ~cancel_filter, withdraw_get_temp_number)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    admin_get_details_handler = ConversationHandler(entry_points=[MessageHandler(Filters.regex('^🔍 ইউজার ডিটেলস$'), admin_get_details_start)], states={ADMIN_GET_DETAILS_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, admin_handle_get_details_code)]}, fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)])
+    cancel_request_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_payment_action, pattern="^cancel:")],
+        states={
+            CHOOSE_CANCEL_OPTION: [CallbackQueryHandler(handle_cancel_option)],
+            GET_CANCEL_REASON: [MessageHandler(Filters.text & ~Filters.command, get_cancel_reason)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+    broadcast_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^📢 ব্রডকাস্ট$'), broadcast_start)],
+        states={
+            BROADCAST_MESSAGE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, broadcast_get_message)],
+            BROADCAST_CONFIRM: [MessageHandler(Filters.regex('^(✅ হ্যাঁ|❌ না)$'), broadcast_confirm)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+    set_notice_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^✍️ নোটিশ সেট করুন$'), set_notice_start)],
+        states={
+            SET_NOTICE_TEXT: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, get_notice_text)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+    
+    block_user_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^🚫 ব্লক করুন$'), block_user_start)],
+        states={
+            BLOCK_USER_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, block_user_get_code)],
+            BLOCK_USER_REASON: [MessageHandler(Filters.text & ~cancel_filter, block_user_get_reason)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+    
+    unblock_user_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^✅ আনব্লক করুন$'), unblock_user_start)],
+        states={
+            UNBLOCK_USER_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, unblock_user_get_code)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+    
+    reset_password_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^🔑 পাসওয়ার্ড রিসেট$'), reset_password_start)],
+        states={
+            RESET_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, reset_password_get_code)],
+            RESET_VERIFY: [MessageHandler(Filters.text & ~cancel_filter, reset_password_verify)],
+            RESET_NEW_PASS: [MessageHandler(Filters.text & ~cancel_filter, reset_password_set_new)],
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    method_control_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^⚙️ পেমেন্ট মেথড কন্ট্রোল$'), method_control_start)],
+        states={
+            METHOD_CONTROL: [CallbackQueryHandler(handle_method_toggle, pattern="^(toggle_|admin_back)")]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    fix_payment_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^🔧 পেমেন্ট ফিক্স$'), fix_payment_start)],
+        states={
+            FIX_PAYMENT_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, fix_payment_get_code)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    view_history_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^💰 জমার হিস্ট্রি$'), view_add_history_start)],
+        states={
+            VIEW_ADD_HISTORY_CODE: [MessageHandler(Filters.text & ~cancel_filter & ~all_menu_filter, view_add_history_get_code)]
+        },
+        fallbacks=[MessageHandler(cancel_filter | all_menu_filter, cancel_and_show_menu)]
+    )
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.regex("^ℹ️ হেল্প$"), help_button_handler))
+    dp.add_handler(MessageHandler(Filters.regex('^📊 ইউজার সংখ্যা$'), get_user_count))
+    dp.add_handler(MessageHandler(Filters.regex('^📊 পেমেন্ট স্ট্যাটাস$'), check_payment_status))
+    dp.add_handler(MessageHandler(Filters.regex('^🎁 অফার/নোটিশ$'), show_notice))
+    # --- New Handlers for Menu Navigation ---
+    dp.add_handler(MessageHandler(Filters.regex('^⚙️ অন্যান্য অপশন$'), show_all_admin_buttons))
+    dp.add_handler(MessageHandler(Filters.regex('^🔙 মেইন মেনু$'), back_to_main_admin_menu))
+    # ---------------------------------------
+    dp.add_handler(add_money_handler)
+    dp.add_handler(bulk_add_money_handler)
+    dp.add_handler(subtract_money_handler)
+    dp.add_handler(update_info_handler); dp.add_handler(withdraw_handler)
+    dp.add_handler(balance_check_handler); dp.add_handler(get_code_handler); dp.add_handler(get_details_handler)
+    dp.add_handler(admin_get_details_handler); dp.add_handler(cancel_request_handler)
+    dp.add_handler(broadcast_handler); dp.add_handler(set_notice_handler)
+    dp.add_handler(block_user_handler); dp.add_handler(unblock_user_handler)
+    dp.add_handler(reset_password_handler)
+    dp.add_handler(method_control_handler)
+    dp.add_handler(fix_payment_handler)
+    dp.add_handler(view_history_handler)
+
+    dp.add_handler(CallbackQueryHandler(show_help_rules, pattern="^show_help_rules$"))
+    dp.add_handler(CallbackQueryHandler(verify_user, pattern="^verify_user$"))
+    dp.add_handler(CallbackQueryHandler(handle_payment_action, pattern="^pay:"))
+    
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_regular_message))
+    
+    logger.info("🤖 Bot running...")
+    updater.start_polling(); updater.idle()
+
+if __name__ == "__main__":
+    main()
